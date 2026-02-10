@@ -1,0 +1,205 @@
+                   ; ##############################################################################
+                   ;
+                   ;      #     # ### ######  ###  #####   #####     #    #     #
+                   ;      ##   ##  #  #     #  #  #     # #     #   # #   ##    #
+                   ;      # # # #  #  #     #  #  #       #        #   #  # #   #
+                   ;      #  #  #  #  #     #  #   #####  #       #     # #  #  #
+                   ;      #     #  #  #     #  #        # #       ####### #   # #
+                   ;      #     #  #  #     #  #  #     # #     # #     # #    ##
+                   ;      #     # ### ######  ###  #####   #####  #     # #     #
+                   ;
+                   ; ##############################################################################
+                   ; ############ KCPSM6 PicoBlaze Keyboard Scanner by cm 10/2010 #################
+                   ; #################### for 12 BIT ADDRESS ROM (4096 Words) #####################
+                   ; ##############################################################################
+                   ;
+                   ; https://www.amd.com/en/products/adaptive-socs-and-fpgas/intellectual-property/picoblaze.html
+                   ; https://www1.hs-bremerhaven.de/kmueller/VHDL/PB_Instr_Ref.pdf
+                   ;
+                   ; 27.01.2025 #51 Neues universelles Framework, hier für MIDI only ohne eigene Tastenabfrage
+                   ; 06.01.2026 #50 BUGFIX, Lower Manual war in #49 ohne Funktion
+                   ; 10.12.2025 #49 Support für neues FPGA mit separatem SAM5504-MIDI-FIFO, MIDI GETBYTE gestrafft
+                   ; 10.02.2025 #47 SPI_AUXPORT mit PWM auf $3C
+                   ; 28.11.2024 #46 SPI_AUXPORT auf $2F für Expander-LEDs in HX3.7
+                   ; 13.06.2024 #44 Differenzierter Key Click, etwas schwächer
+                   ; 30.07.2021 #37 Sendet page_init bei Split-Änderungen, SplitMode 5 (AddPedalToLower)
+                   ; 18.05.2021 #36 Andere Noise-Berechnung
+                   ; 03.09.2020 #28 Keine Übersetzung Sostenuto mehr
+                   ; 22.02.2020 #25 Auch Kanal +3 an AVR für Touchpad
+                   ; 20.11.2019 #23 MIDI-Dispatcher verbessert, wird öfter ausgeführt
+                   ; 10.11.2019 #20 Local Enables auf SPI $2E (hier irrelevant)
+                   ; 13.02.2018 #18 Bug in Key Transpose behoben (nicht bei MIDI)
+                   ; 22.11.2018 #17 Split-Handling gelöscht, weil keine eigene Tastatur
+                   ; 12.09.2018 #15 Bug in Midi-Kanalwahl behoben
+                   ; 14.08.2018 #14 Bug in local_midisend_off (Dyn. 1 gesendet) behoben
+                   ; 09.08.2018 #12 Sostenuto-Controller 42 geändert auf 45, HOLD2-Pedal wg. NI B4-PERC Konflikt
+                   ; 24.04.2018 #11 Bugfixes für Fatar
+                   ; 20.02.2017 #10 Zusätzlicher MIDI-Ausgang für SAM5504
+                   ; 10.10.2017 Angepasst für KCPSM6, Inputs für Cancel Manual und HW-Sostenuto/Sustain auf PL Auxiliary
+                   ; Pins schalten nach Masse!
+                   ; Pin 6 = Bit 5 Sustain Upper
+                   ; Pin 5 = Bit 4 Sostenuto Upper
+                   ; Pin 4 = Bit 3 Sustain Lower
+                   ; Pin 3 = Bit 2 Sostenuto Lower
+                   ; Pin 2 = Bit 1 Cancel MIDI Kanal invert., 11 = Cancel Off, 10 = Cancel Upper,
+                   ; Pin 1 = Bit 0 Cancel MIDI Kanal invert., 01 = Cancel Lower, 00 = Cancel Pedal
+                   ;
+                   CONSTANT c_midi_minofs, 01           ; Local MIDI Dynamikkurven-Offset, 1-2 für Fatar Mx
+                   CONSTANT c_corevers, 63              ; $50=SR4014, $51=Fatar, $52=Opto, $53=MIDI RcvOnly
+                   CONSTANT c_corevers_midionly, 63     ; zum Vergleichen im MIDI-Scan-Treiber
+                   CONSTANT c_corerevi, 50              ; Revisionsnummer
+                   CONSTANT c_dyn_threshold, 28         ; MIDI-Dynamikschwelle für full click
+                   CONSTANT c_midi_mindyn, 10           ; MIDI-Minimaldynamik langsame Taste
+                   ;
+                   ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                   ;
+                   ; Je nach Tastaturumfang sind anzupassen:
+                   CONSTANT c_maxkeys, 60'd             ; längste vorhandene Tastatur (44/49/61) +1
+                   CONSTANT c_maxkeys_plus1, 61'd       ; längste vorhandene Tastatur (44/49/61) +1
+                   CONSTANT c_maxkeys_8x8, 64'd         ; für Matrix-Abfrage
+                   CONSTANT c_maxbasskeys, 25'd         ; Anzahl der Pedal-Tasten an AuxPort PL8
+                   CONSTANT c_gen_firstkey, 36'd        ; Tonumfang INPUT MIDI-Notennummern
+                   CONSTANT c_gen_lastkey_plus1, 97'd   ; 96+1 wg. COMPARE
+                   CONSTANT c_midi_offset, 36'd         ; Offset zu unterster MIDI-Note "C" bei 5 Oktaven (default 36)
+                   CONSTANT c_scankey_delay, 24'd       ; Hardware-Timer in SYNC-Ticks (20,833 µs), default 500 µs Scandurchlauf
+                   ;
+                   ; ##############################################################################
+                   ;
+                   ;    ### #     #  #####  #       #     # ######  #######
+                   ;     #  ##    # #     # #       #     # #     # #
+                   ;     #  # #   # #       #       #     # #     # #
+                   ;     #  #  #  # #       #       #     # #     # #####
+                   ;     #  #   # # #       #       #     # #     # #
+                   ;     #  #    ## #     # #       #     # #     # #
+                   ;    ### #     #  #####  #######  #####  ######  #######
+                   ;
+                   ; ##############################################################################
+                   ;
+                   INCLUDE "registers.psm"              ; alle Register-Definitionen mit JUMP cold_start
+                   INCLUDE "init.psm"
+                   INCLUDE "switches.psm"               ; Fußschalter einlesen und verarbeiten
+                   INCLUDE "states.psm"                 ; Zustandsautomaten für Tastenverarbeitung
+                   INCLUDE "events_mpx.psm"             ; Event-Loop für MPX-RAM Verarbeitung
+                   INCLUDE "timers.psm"                 ; Timer-Routinen für Zustandsautomaten
+                   INCLUDE "midi_io.psm"                ; MIDI-Subroutinen für MIDI-Empfang
+                   ;
+                   ;
+                   ; ###############################################################################
+                   ;
+                   ;    #     #    #    ### #     #
+                   ;    ##   ##   # #    #  ##    #
+                   ;    # # # #  #   #   #  # #   #
+                   ;    #  #  # #     #  #  #  #  #
+                   ;    #     # #######  #  #   # #
+                   ;    #     # #     #  #  #    ##
+                   ;    #     # #     # ### #     #
+                   ;
+                   ; ###############################################################################
+                   ;
+       cold_start: 
+                   ; Einsprungpunkt nach Laden des Scan Cores
+                   DISABLE INTERRUPT
+                   CALL port_init
+                   CALL scan_init
+                   ;
+        main_loop: 
+                   CALL midi_rx_check                   ; MIDI-Daten empfangen? - ca. 1,7 µs
+                   ; auf Scan-Freigabe durch Timer warten
+                   INPUT s0, SCANTIMER_ZERO             ; auf Scan-Freigabe warten
+                   COMPARE s0, 00                       ; Scan-Timer abgelaufen?
+                   JUMP Z, main_loop
+                   CALL scantimer_start                 ; Scan-Timer neu starten
+                   ; Tastenzustand aller Manuale ermitteln und behandeln
+                   ; Hier gibt es nichts zu tun!
+                   CALL local_scan_keybds
+                   CALL local_scan_pedal
+                   CALL scan_config                     ; Parameter-Änderungen? - ca. 3,4µs
+                   ; CALL handle_sustain_sw             ; Sustain/Sostenuto-Eingangspins, hier nicht benutzt
+                   ;
+                   CALL update_noisetimers              ; alle Timer updaten - ca. 26 µs, in 1 ms Abstand
+                   ; CALL active_sensing                ; ca. 1,3 µs
+                   ; MIDI hat Timing-mäßig Vorrang vor eigener Tastatur,
+                   ; um Buffer-Überläufe zu verhindern
+                   CALL midi_rx_check                   ; MIDI-Daten empfangen? - ca. 1,7 µs
+                   CALL event_handling                  ; Tasten auswerten, ca. 106 µs
+                   ;
+                   ; PWM-Werte für Expander-LEDs aktualisieren (nur bei MIDI-Scantreiber)
+                   INPUT s0, SPI_AUXPORT
+                   XOR s0, FF                           ; invertiert, LED-Anode an Vcc
+                   OUTPUT s0, AUXPORT                   ; Expander LEDs - nur in MIDI-Scantreiber benutzen!
+                   ;
+                   INPUT s0, SPI_PWM_LOCALDISABLES
+                   SR0 s0
+                   SR0 s0
+                   SR0 s0
+                   SR0 s0                               ; PWM-Wert
+                   OR s0, 80                            ; Bit 7, ENA PWM
+                   OUTPUT s0, ENA_PWM                   ; Expander LEDs PWM-Wert und Enable - nur in MIDI-Scantreiber benutzen!
+                   ;
+                   JUMP main_loop
+                   ;
+                   ;
+                   ; ###############################################################################
+                   ;
+                   ;    ######  ####### ######  #######
+                   ;    #     # #     # #     #    #
+                   ;    #     # #     # #     #    #
+                   ;    ######  #     # ######     #
+                   ;    #       #     # #   #      #
+                   ;    #       #     # #    #     #
+                   ;    #       ####### #     #    #
+                   ;
+                   ; ###############################################################################
+                   ;
+                   ; Scan Port Initialisierung und Hilfsroutinen
+                   ;
+                   ;
+        port_init: 
+                   ; Scan-Ports initialisieren
+                   LOAD s0, FF                          ; für Fatar-/Opto-Interface, hier für TEST
+                   OUTPUT s0, SCANPORT_DDR
+                   LOAD s0, FF                          ; für Testport
+                   OUTPUT s0, AUXPORT_DDR
+                   LOAD s0, 00                          ; Sustainpedal, alles Eingänge
+                   OUTPUT s0, SWITCHPORT_DDR
+                   RETURN 
+                   ;
+                   ;
+                   ; ###############################################################################
+                   ;
+                   ;     ######  ####### ######     #    #
+                   ;     #     # #       #     #   # #   #
+                   ;     #     # #       #     #  #   #  #
+                   ;     ######  #####   #     # #     # #
+                   ;     #       #       #     # ####### #
+                   ;     #       #       #     # #     # #
+                   ;     #       ####### ######  #     # #######
+                   ;
+                   ; ###############################################################################
+                   ;
+                   ;
+ local_scan_pedal: 
+                   ; AUXPORT führt PWM für LEDs, nicht benutzen!
+                   RETURN 
+                   ;
+                   ; ###############################################################################
+                   ;
+                   ;     #    # ####### #     # ######  ######
+                   ;     #   #  #        #   #  #     # #     #
+                   ;     #  #   #         # #   #     # #     #
+                   ;     ###    #####      #    ######  #     #
+                   ;     #  #   #          #    #     # #     #
+                   ;     #   #  #          #    #     # #     #
+                   ;     #    # #######    #    ######  ######
+                   ;
+                   ; ###############################################################################
+                   ;
+                   ;
+local_scan_keybds: ; Hier gibt es nichts zu tun, Nur ein kleiner Port-Test für LA am SCANPORT
+                   OUTPUT s5_scan_key, SCANPORT
+                   ADD s5_scan_key, 01
+                   COMPARE s5_scan_key, c_maxkeys_plus1
+                   JUMP NZ, local_scan_keybds
+                   LOAD s5_scan_key, 00
+                   OUTPUT s5_scan_key, SCANPORT
+                   RETURN 

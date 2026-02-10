@@ -1,0 +1,94 @@
+                        ; ###############################################################################
+                        ; Abfrage Hardware-Switches (Sustain, Sostenuto)
+                        ; ###############################################################################
+                        ;
+     handle_sustain_sw:
+                        ; abhängig vom PL16-Bits Flag in s_sustain_xxx oder s_sosten_xxx setzen/löschen
+                        INPUT s3_keystatus, SWITCHPIN        ; Bit 5 ist Sustain upper, Bit 3 lower
+                        XOR s3_keystatus, FF                 ; invertiert!
+                        AND s3_keystatus, 3C
+                        FETCH s0, s_switches_old             ; alter Schalterzustand
+                        XOR s0, s3_keystatus                 ; geänderte Bits jetzt auf 1 in s0
+                        RETURN Z                             ; nichts geändert
+                        ; Es hat sich etwas geändert, jetzt einzeln verzweigen
+                        FETCH s0, s_switches_old
+                        AND s0, 20                           ; Pin 6 = Bit 5 Sustain Upper
+                        LOAD s1, s3_keystatus
+                        AND s1, 20                           ; Pin 6 = Bit 5 Sustain Upper
+                        XOR s0, s1                           ; geändertes Bit jetzt auf 1
+                        CALL NZ, handle_sust_upr_chngd
+                        ;
+                        FETCH s0, s_switches_old
+                        AND s0, 10                           ; Pin 5 = Bit 4 Sostenuto Upper
+                        LOAD s1, s3_keystatus
+                        AND s1, 10                           ; Pin 5 = Bit 4 Sostenuto Upper
+                        XOR s0, s1                           ; geändertes Bit jetzt auf 1
+                        CALL NZ, handle_sostn_upr_chngd
+                        ;
+                        FETCH s0, s_switches_old
+                        AND s0, 08                           ; Pin 4 = Bit 3 Sustain Lower
+                        LOAD s1, s3_keystatus
+                        AND s1, 08                           ; Pin 4 = Bit 3 Sustain Lower
+                        XOR s0, s1                           ; geändertes Bit jetzt auf 1
+                        CALL NZ, handle_sust_lwr_chngd
+                        ;
+                        FETCH s0, s_switches_old
+                        AND s0, 04                           ; Pin 3 = Bit 2 Sostenuto Lower
+                        LOAD s1, s3_keystatus
+                        AND s1, 04                           ; Pin 3 = Bit 2 Sostenuto Lower
+                        XOR s0, s1                           ; geändertes Bit jetzt auf 1
+                        CALL NZ, handle_sostn_lwr_chngd
+                        ;
+                        STORE s3_keystatus, s_switches_old
+                        RETURN
+                        ;
+                        ; aktuelles Switch-Bit in s1
+ handle_sust_upr_chngd:
+                        LOAD s9_manual_select, 00
+                        JUMP handle_sustain_chngd_0
+ handle_sust_lwr_chngd:
+                        LOAD s9_manual_select, 01
+handle_sustain_chngd_0:
+                        CALL NZ, test_s1_set_s2              ; s2 auf $7F wenn ein Switch-Bit gesetzt ist
+                        LOAD s6_idx_ptr, s_sustain_upr
+                        ADD s6_idx_ptr, s9_manual_select
+                        STORE s2, (s6_idx_ptr)
+                        LOAD s1, 40                          ; Sustain-Controller
+                        JUMP local_send_fs
+                        ;
+                        ;
+handle_sostn_upr_chngd:
+                        LOAD s9_manual_select, 00
+                        JUMP handle_sostn_chngd_0
+handle_sostn_lwr_chngd:
+                        LOAD s9_manual_select, 01
+  handle_sostn_chngd_0:
+                        ;
+                        CALL NZ, test_s1_set_s2              ; s2 auf $7F wenn ein Switch-Bit gesetzt ist
+                        LOAD s6_idx_ptr, s_sosten_upr
+                        ADD s6_idx_ptr, s9_manual_select
+                        STORE s2, (s6_idx_ptr)
+                        LOAD s1, 45                          ; HOLD2-Sostenuto-Controller
+                        JUMP local_send_fs
+                        ;
+        test_s1_set_s2:
+                        LOAD s2, 00
+                        TEST s1, 3C
+                        RETURN Z
+                        LOAD&RETURN s2, 7F
+                        ;
+                        ; Fußschalter-MIDI senden. Hier kommen wir nur hin, wenn sich etwas geändert hat.
+                        ; aktueller Schalterzustand in s2, Controller in s1, Kanal in s9_manual_select
+         local_send_fs:
+                        INPUT s0, SPI_MIDIOPT                ; Bit 7 (MSB): USE SOST/SUSTAIN
+                        AND s0, 80
+                        RETURN Z
+                        LOAD s8_msb, s1
+                        FETCH s0, s_midich                   ; eingestellter Kanal
+                        ADD s0, s9_manual_select             ; Manual-Nummer addieren
+                        OR s0, B0                            ; MIDI CC senden
+                        CALL midi_tx_s0
+                        LOAD s0, s8_msb                      ; war vorher s1 = Controllernummer
+                        CALL midi_tx_s0
+                        LOAD s0, s2                          ; Wert senden
+                        JUMP midi_tx_s0                      ; weiter mit midi_tx_s0

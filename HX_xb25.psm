@@ -1,0 +1,2235 @@
+                             ;
+                             ; ##############################################################################
+                             ; ############ KCPSM6 PicoBlaze Keyboard Scanner by cm 10/2010 #################
+                             ; #################### for 12 BIT ADDRESS ROM (4096 Words) #####################
+                             ; ##############################################################################
+                             ;
+                             ; 13.06.2024 #44 Differenzierter Key Click, etwas schwächer
+                             ; 03.11.2021 #40 KEYS_ON_UPPER/LOWER nur noch 2 Bits für FPGA 03112021, auf read_db(0) Bits 6 und 7
+                             ; 18.05.2021 #36 Andere Noise-Berechnung
+                             ; 12.01.2021 #33 Bug in ResetDynTimers behoben
+                             ; 12.01.2021 #31 Dynamik-Ermittlung über variables Timer-Dekrement (1/t)
+                             ; 09.01.2021 #30 Scan-Dynamik jetzt per Statemachine
+                             ; 03.09.2020 #28 Keine Übersetzung Sostenuto mehr
+                             ; 22.02.2020 #25 Auch Kanal +3 an AVR für Touchpad
+                             ; 20.11.2019 #23 MIDI-Dispatcher verbessert, wird öfter ausgeführt
+                             ; 10.11.2019 #20 Local Enables auf SPI $2E
+                             ; 21.02.2018 #19 Kleine Verzögerung vor Auslesen der Tastenkontakte wg. Emils Geisternoten
+                             ; 13.02.2018 #18 Bug in Key Transpose behoben
+                             ; 22.11.2018 #17 Split-Handling jetzt nur noch in Tastatur-Scan
+                             ; 12.09.2018 #15 Bug in Midi-Kanalwahl behoben
+                             ; 14.08.2018 #14 Bug in local_states_off (Dyn. 1 gesendet) behoben
+                             ; 09.08.2018 #12 Sostenuto-Controller 42 geändert auf 45, HOLD2-Pedal wg. NI B4-PERC Konflikt
+                             ; 24.04.2018 #11 Bugfixes für Fatar
+                             ; 20.10.2017 #10 Zusätzlicher MIDI-Ausgang für SAM5504
+                             ; 10.10.2017 Angepasst für KCPSM6, Inputs für Cancel Manual und HW-Sostenuto/Sustain auf PL Auxiliary
+                             ; Pins schalten nach Masse!
+                             ; Pin 6 = Bit 5 Sustain Upper
+                             ; Pin 5 = Bit 4 Sostenuto Upper
+                             ; Pin 4 = Bit 3 Sustain Lower
+                             ; Pin 3 = Bit 2 Sostenuto Lower
+                             ; Pin 2 = Bit 1 Cancel MIDI Kanal invert., 11 = Cancel Off, 10 = Cancel Upper,
+                             ; Pin 1 = Bit 0 Cancel MIDI Kanal invert., 01 = Cancel Lower, 00 = Cancel Pedal
+                             ; 31.12.2015 Kleinen Bug in Split-Setup beseitigt, Split darf nicht bei Splitpunkt-Änderungen gesetzt werden
+                             ; 18.12.2015 #20 Split-Default jetzt mit +1/+2 Oktaven für Lower on Upper, oberste Taste wird Splitpunkt
+                             ; Anzahl der festgehaltenen Tasten bestimmt Split Mode, oberste Taste wird Splitpunkt
+                             ; 1 Taste Lower: Split Pedal to Lower
+                             ; 1 Taste Upper: Split Lower to Upper
+                             ; 2 Tasten Upper: Split Pedal to Upper
+                             ; 3 Tasten Upper: Split Lower to Upper +1 Oktave
+                             ; 4 Tasten Upper: Split Lower to Upper +2 Oktaven
+                             ;
+                             CONSTANT c_corevers, 65                 ; $60=SR4014, $61=Fatar, $62=Opto, $63=MIDI, $64=OrganScan61, $65=XB2-5
+                             CONSTANT c_corerevi, 45                 ; Revisionsnummer
+                             CONSTANT c_dyn_threshold, 28
+                             ; MIDI-Dynamikschwelle für full click
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+                             ; Je nach Tastaturumfang sind anzupassen:
+                             CONSTANT c_maxkeys, 61'd                ; l�ngste vorhandene Tastatur (44/49/61)
+                             CONSTANT c_maxkeys_plus_one, 62'd       ; l�ngste vorhandene Tastatur (44/49/61) +1
+                             CONSTANT c_maxbasskeys, 25'd            ; Anzahl der Pedal-Tasten an SCAN_SR_Port PL8
+                             CONSTANT c_midi_firstkey, 12'd
+                             CONSTANT c_midi_lastkey, 122'd
+                             CONSTANT c_gen_firstkey, 36'd           ; Tonumfang INPUT MIDI-Notennummern
+                             CONSTANT c_gen_lastkey, 97'd            ; 96+1 wg. COMPARE
+                             CONSTANT c_midi_offset, 36'd            ; Offset zu unterster MIDI-Note "C" bei 5 Oktaven (default 36)
+                             CONSTANT c_scankey_delay, 47'd          ; Delay pro Taste für 1 ms Scandurchlauf INPUT SYNC-Ticks (20,4 �s)
+                             ;
+                             ; nach Assemblierung DAT-Datei für XMODEM-Upload
+                             ; erstellen mit Tool hex2dat_kcpsm6.exe oder Batch convert_xxx.bat
+                             ;
+                             ; ##############################################################################
+                             ; ############################ MPX-RAM-Organisation ###########################
+                             ; ##############################################################################
+                             ;
+                             ; Ein/Ausschalten der HX3-Tastenkontakte erfolgt durch Schreiben der
+                             ; Kontaktdaten INPUT ein Dual-Port-RAM, das sogerannte MPX-RAM.
+                             ; Jede Taste(nspalte) belegt eine Adresse,
+                             ; so dass das tiefste "C" immer Adresse 0 hat, das höchste "C" Adresse 60.
+                             ; für jedes Manual stehen 8 Bits des 18-Bit-Datenbusses zur Verfügung,
+                             ; für das Pedal 2 (sonst ungenutzte Paritätsbits). Jeder Teil kann getrennt geschrieben/gelesen werden.
+                             ; MPX-RAM besteht aus 16 Pages je 64 Worte, 16 Bit plus zwei "Parity"-Bits,
+                             ; die hier für den Pedal-Status benutzt werden.
+                             ; Auswahl der Page über PB_PAGE.
+                             ; s8_msb, LSB und Parity-Bits können getrennt über STROBEs geschrieben werden.
+                             ; Page 0 dient direkt als Freigabe für Tastenkontakte:
+                             ; ##### LOWER ##### ##### UPPER ##### - Bytes
+                             ; 7 MSN 4 3 LSN 0 7 MSN 4 3 LSN 0 - Nibbles
+                             ; #NOISE# #STEADY# #NOISE# #STEADY#
+                             ; - C B A L C B A - C B A L C B A - Bits
+                             ;
+                             ; Dabei wird Wert ABC jeweils anhand des folgenden Schemas dekodiert,
+                             ; mit ABC = Anzahl eingeschalteter Tastenkontakte lt. folgender Tabelle, L = Level-Bit (0 = halber Pegel)
+                             ; ABC Kontakte Busbar 15..0
+                             ; 0   0000000000000000, ; alle OFF
+                             ; 1   0000000000100000, ; Stufe 1...
+                             ; 2   0000000000100100,
+                             ; 3   0000000010100100,
+                             ; 4   0011000010100110,
+                             ; 5   0011000111100110,
+                             ; 6   1011101111101111,
+                             ; 7   1111111111111111 ; bis Stufe 7, alle ON
+                             ;
+                             ; Es ist somit (ggf. für Opto/Hallsensor-Tastaturen) möglich, das Click-Noise- und Steady-Signal getrennt
+                             ; in 8 Stufen und mit zwei Pegelstufen (halber/voller) nacheinander einzuschalten, um das Kontaktprellen
+                             ; und den Kontakt-übergangswiderstand zu simulieren.
+                             ;
+                             ; Verhalten Tastenkontakt-Bits nach Dekodierung ABC -> Kontakte aus obiger Tabelle
+                             ; noise_bb_bit  steady_bb_bit  level_full_bit  Resultat
+                             ; 0             0              0               OFF
+                             ; 1             0              0               HALF NOISE
+                             ; 0             1              0               HALF STEADY
+                             ; 1             1              0               HALF NOISE, HALF STEADY
+                             ; 0             0              1               OFF
+                             ; 1             0              1               FULL NOISE
+                             ; 0             1              1               FULL STEADY
+                             ; 1             1              1               FULL STEADY
+                             ;
+                             ; Pedalkontakt CONT_PEDAL ist an Bit(0) angeschlossen, Bit (1) kann als Scratch dienen.
+                             ; Die Nibbles können INPUT pb_scanif.vhd einzeln gelesen werden!
+                             ; PAGE 1 als Soft-Timer für Tastenkontakte
+                             ; PAGE 2 als Soft-Timer für Noise
+                             ; PAGEs 6 bis 15 können nach Belieben verwendet werden.
+                             ;
+                             ; MPX RAM_PAGE Offsets
+                             ; Seitenaufteilung INPUT 64-Byte-Seiten über RAM_PAGE
+                             CONSTANT c_page_vcontacts, 00           ; virtuelle Tastenkontakte, 0..61, direktes Lesen und Schreiben
+                             ; Alle Timer starten bei Schreiben eines Wertes ungleich 0 und stoppen bei Erreichen von 255.
+                             CONSTANT c_page_dyntimer, 01            ; Dynamik-Timer 0..61
+                             CONSTANT c_page_noisetimer, 02          ; Noise-Timer 0..61
+                             CONSTANT c_page_xb2data, 04             ; Dynamik-Werte XB2 Upper
+                             CONSTANT c_page_keystatus1, 04          ; Eigene Tastatur Zustand für Tasten 12..63
+                             CONSTANT c_page_keystatus2, 05          ; Eigene Tastatur Zustand für Tasten 64.. 121
+                             CONSTANT c_page_midirx1, 06             ; MIDI-Empfangsdaten Dynamik für Tasten 12..63
+                             CONSTANT c_page_midirx2, 07             ; MIDI-Empfangsdaten Dynamik für Tasten 64.. 121
+                             CONSTANT c_page_sostenutoflags, 08      ; Sostenuto-Flags 0..61
+                             CONSTANT c_page_timerstates, 09         ; MIDI-sent-Flags 0..61
+                             CONSTANT c_page_localdyn1, 0A           ; MIDI-Empfangsdaten Dynamik für Tasten 12..63
+                             CONSTANT c_page_localdyn2, 0B           ; MIDI-Empfangsdaten Dynamik für Tasten 64.. 121
+                             CONSTANT c_page_oldkeystatus1, 0C       ; Vorheriger Zustand für Tasten 12..63
+                             CONSTANT c_page_oldkeystatus2, 0D       ; Vorheriger Zustand für Tasten  64.. 121
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ; Portadressen bidirektional
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+                             ; $00 bis $07 Einzelbits SCAN_FT_PORT Eingang, für Opto und Fatar
+                             ;
+                             CONSTANT SCAN_FT_IO1, 00
+                             CONSTANT SCAN_FT_IO2, 01
+                             CONSTANT SCAN_FT_IO3, 02
+                             CONSTANT SCAN_FT_IO4, 03
+                             CONSTANT SCAN_FT_IO5, 04
+                             CONSTANT SCAN_FT_IO6, 05
+                             CONSTANT SCAN_FT_IO7, 06
+                             CONSTANT SCAN_FT_IN8, 07                ; nur Eingang!
+                             ;
+                             CONSTANT K_ACK, 00                      ; für XB2
+                             CONSTANT K_ENALWR, 01                   ; für XB2
+                             CONSTANT K_ENAUPR, 02                   ; für XB2
+                             CONSTANT K_RST, 03                      ; für XB2
+                             CONSTANT SR4014_CLK, 04                 ; für XB2
+                             CONSTANT SR4014_LOAD, 05                ; für XB2
+                             CONSTANT SR4014_DATA, 06                ; für XB2
+                             ;
+                             CONSTANT SCAN_FT_PIN, 10                ; Scan Port gesamt Leser
+                             CONSTANT SCAN_FT_PORT, 10               ; Scan Port gesamt Schreiben
+                             CONSTANT SCAN_FT_PORT_DDR, 11           ; Data Direction für Scan IF
+                             ;
+                             ; $00 bis $07 Einzelbits SCAN_SR Eingang, für OrganScan/HOAX5 mit 4014 und Bass13/25
+                             ; Dieser Port hat Pullups!
+                             ;
+                             CONSTANT SCAN_SR_PIO1, 08
+                             CONSTANT SCAN_SR_PIO2, 09
+                             CONSTANT SCAN_SR_PIO3, 0A
+                             CONSTANT SCAN_SR_PIO4, 0B
+                             CONSTANT SCAN_SR_PIO5, 0C
+                             CONSTANT SCAN_SR_PIO6, 0D
+                             CONSTANT SCAN_SR_PIO7, 0E
+                             CONSTANT SCAN_SR_PIN8, 0F
+                             ;
+                             CONSTANT K_EMPTY, 0E                    ; für XB2, Data Present (D6)
+                             CONSTANT K_STB, 0F                      ; für XB2
+                             CONSTANT K_DATA, 18                     ; für XB2
+                             ;
+                             CONSTANT SCAN_SR_PIN, 18                ; Auxiliary Port gesamt
+                             CONSTANT SCAN_SR_PORT, 18
+                             CONSTANT SCAN_SR_PORT_DDR, 19           ; Data Direction für Scan IF
+                             ;
+                             CONSTANT AUX_IN, 32                     ; (50), PresetScan
+                             CONSTANT AUX_PORT, 28                   ; (40) Preset-Scan-Port
+                             CONSTANT AUX_PORT_DDR, 29               ; (41) Preset - Scan - PortDirection
+                             ;
+                             ; Output ports
+                             CONSTANT c_strobe_mask, 20              ; für indirektes Schreiben
+                             CONSTANT UPPER_STROBE, 20               ; Schreibzugriff erzeugt Write für Busbar- und Noise-Enables Upper (1 Byte)
+                             CONSTANT LOWER_STROBE, 21               ; Schreibzugriff erzeugt Write für Busbar- und Noise-Enables Lower (1 Byte)
+                             CONSTANT PEDAL_STROBE, 22               ; Schreibzugriff erzeugt Write für Pedal-Bits (2 Bits)
+                             CONSTANT MIDI_CMD, 30                   ; MIDI-Befehl
+                             CONSTANT MIDI_DB1, 31
+                             CONSTANT MIDI_DB2, 32
+                             CONSTANT MIDI_STR, 33                   ; MIDI Strobe für AVR, neg. Flanke
+                             CONSTANT STATUS, 34                     ; STATUS an AVR SPI, Bit 0 bis 3 durch PB schreibbar, Bit 4 und 5 direkt SPI MIDI FIFO STAT
+                             CONSTANT KEYS_ON_UPR, 35                ; Bit 0: auf Upper sind Tasten gedrückt
+                             CONSTANT KEYS_ON_LWR, 36                ; Bit 0: auf Lower sind Tasten gedrückt
+                             ; CONSTANT BASS_ENV, 37                 ; UNUSED
+                             CONSTANT PEDAL_DOWN, 38                 ; Bit 0
+                             CONSTANT TEST_PORT, 39                  ; LED/LA-TEST
+                             CONSTANT MIDI_OUT_SEL, 3A               ; auf 4-fach Multiplexer,
+                             ; MIDI_OUT_SEL: 0 = MIDI_TX_1, 1 = MIDI_IN_1, 2 = MIDI_IN_2, 3 = MIDI_FROM_SAM (USB)
+                             ; Universal-Timer, hier für Scan-Durchlauf, 255 = 5,22 ms
+                             ; wird mit jedem SYNC alle 20,48 µs dekrementiert bis 0 erreicht
+                             CONSTANT SCANTIMER_VAL, 3D              ; Schreiben des neuen Wertes startet Timer
+                             CONSTANT SCANTIMER_ZERO, 3E             ; Flag wenn 0 erreicht
+                             CONSTANT NOISE_FREQ, 3F                 ; bestimmt Noise-Frequenz
+                             CONSTANT RAM_PAGE, 40                   ; Seitenadresse zum einfacheren Zugriff, Page 0 = MPX Dual Port
+                             CONSTANT RAM_ADDR, 41                   ; für alle Zugriffe gültig
+                             CONSTANT RAM_WRDATA, 42                 ; zu schreibende Daten
+                             CONSTANT MIDI_TX_1, 80                  ; MIDI UART-Tx-FIFO MAIN
+                             CONSTANT MIDI_TX_2, 81                  ; MIDI UART-Tx-FIFO VENT (intern an Ventilator oder Mini-GM-Modul)
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ; Input Ports
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ; Flags für SPI-Empfang:
+                             ; Bit 0 = Daten wurden geschrieben (wird durch Lesen der SPI-Register gelöscht)
+                             ; Bit 1 = AVR-MIDI FIFO Daten im Buffer,
+                             ; Bit 2 = AVR-MIDI FIFO Buffer halb voll
+                             ; Bit 3 = AVR-MIDI FIFO Buffer voll
+                             CONSTANT SPI_FLAG, 30                   ; "0000000" & spiflag
+                             CONSTANT TX_STATUS, 31                  ; Bit 0 = Buffer halbvoll, Bit 1 = Buffer voll
+                             CONSTANT c_read_mask, 34                ; für indirektes Lesen
+                             CONSTANT RD_UPPER, 34                   ; Upper-Byte vom MPX-RAM
+                             CONSTANT RD_LOWER, 35                   ; Lower-Byte vom MPX-RAM
+                             CONSTANT RD_PEDAL, 36                   ; Pedal-Bits vom MPX-RAM (1:0)
+                             CONSTANT MIDI_IN1, 38
+                             CONSTANT MIDI_IN1_STATUS, 39            ; "0000" & midi_1_full & midi_1_half & midi_1_datapresent & '0';
+                             CONSTANT MIDI_IN2, 3A
+                             CONSTANT MIDI_IN2_STATUS, 3B            ; "0000" & midi_2_full & midi_2_half & midi_2_datapresent & '0';
+                             CONSTANT MIDI_AVR, 3C                   ; MIDI vom AVR über SPI
+                             CONSTANT MIDI_AVR_STATUS, 3D            ; "0000" & avrfifo_full & avrfifo_half & avrfifo_datapresent & avrmidiflag
+                             CONSTANT RND_NUMBER, 3F                 ; Zufallswert 8 Bit
+                             ; Werte vom AVR-SPI
+                             CONSTANT SPI_MIDICH, 24                 ; Adresse $04 von außen (AVR)
+                             CONSTANT SPI_MIDIOPT, 25
+                             CONSTANT SPI_SPLITMODE, 26
+                             CONSTANT SPI_SPLITON, 27                ; Adresse $07 von außen (AVR)
+                             CONSTANT SPI_SPLITPOINT, 28             ; Adresse $08 von außen (AVR)
+                             CONSTANT SPI_CLICKLEN, 29
+                             CONSTANT SPI_GENTRANSPOSE, 2A           ; Generator Transpose
+                             CONSTANT SPI_CONFIG_1, 2B               ; EARLY_KEY (Bit 0), VelocityFactor (Bit 7..2)
+                             ; SPI_AVR_MIDI, 2C ; AVR-MIDI-Daten, FIFO-Eingang
+                             CONSTANT SPI_KEYTRANSPOSE, 2D           ; Key Transpose (local keyboard)
+                             CONSTANT SPI_LOCALDISABLES, 2E
+                             ;
+                             CONSTANT c_state_off, 00                ; für Tastenabfrage, Ruhezustand OFF
+                             CONSTANT c_state_on, 01                 ; für Tastenabfrage, Taste ON
+                             ;
+                             CONSTANT c_key_idle, 00                 ; für Tastenabfrage, Ruhezustand
+                             CONSTANT c_key_moving, 01               ; für Tastenabfrage, in Bewegung
+                             CONSTANT c_key_dirty, 02                ; für Tastenabfrage, Ende erreicht (dirty)
+                             CONSTANT c_key_on, 03                   ; für Tastenabfrage, Ende erreicht
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ; Picoblaze Scratchpad Memory
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+                             CONSTANT s_oldkeystatus_upper, 00       ; für Tastenabfrage, vorheriger Tastenzustand - NOCH NICHT BENUTZT!
+                             CONSTANT s_oldkeystatus_lower, 00
+                             CONSTANT s_oldkeystatus_pedal, 00
+                             CONSTANT s_gentranspose, 03             ; Tongenerator-Transpose
+                             CONSTANT s_keytranspose, 04             ; Tastatur-Transpose
+                             CONSTANT s_split_on, 05                 ; Letzter Split-Zustand
+                             CONSTANT s_velocityfac, 06              ; Faktor für Timer-Dekrement
+                             CONSTANT s_timerval, 07                 ; für Timer-Dekrement
+                             CONSTANT s_splitpoint, 08               ; Tastennummer von SPI-AVR
+                             CONSTANT s_splitmode, 09
+                             ; 10..29 MIDI-Daten für Interpreter/Dispatcher
+                             CONSTANT s_midi_cmd, 10'd
+                             CONSTANT s_midi_data1, 11'd
+                             CONSTANT s_midi_data2, 12'd
+                             CONSTANT s_midi_len, 13'd
+                             CONSTANT s_midi_cmd_masked, 14'd        ; upper Nibble
+                             CONSTANT s_midi_chan_masked, 15'd       ; lower Nibble
+                             ; MIDI-Daten per Polling vom FIFO, Port 1
+                             CONSTANT s_midi_1_cmd, 16'd
+                             CONSTANT s_midi_1_data1, 17'd
+                             CONSTANT s_midi_1_data2, 18'd
+                             CONSTANT s_midi_1_len, 19'd
+                             CONSTANT s_midi_1_counter, 20'd
+                             ; MIDI-Daten per Polling vom FIFO, Port 2
+                             CONSTANT s_midi_2_cmd, 21'd
+                             CONSTANT s_midi_2_data1, 22'd
+                             CONSTANT s_midi_2_data2, 23'd
+                             CONSTANT s_midi_2_len, 24'd
+                             CONSTANT s_midi_2_counter, 25'd
+                             ; MIDI-Daten per Polling vom AVR-FIFO
+                             CONSTANT s_midi_3_cmd, 26'd
+                             CONSTANT s_midi_3_data1, 27'd
+                             CONSTANT s_midi_3_data2, 28'd
+                             CONSTANT s_midi_3_len, 29'd
+                             CONSTANT s_midi_3_counter, 30'd
+                             CONSTANT s_midi_3_SysExFlag, 31'd
+                             ;
+                             CONSTANT s_keycount_upper, 32'd
+                             CONSTANT s_keycount_lower, 33'd
+                             CONSTANT s_keycount_pedal, 34'd
+                             CONSTANT s_midi_activesensing, 35'd     ; Z�hler/Timer für MIDI Active Sensing
+                             CONSTANT s_key_matrix, 36'd             ; für FATAR
+                             CONSTANT s_group_matrix, 37'd           ; für FATAR
+                             CONSTANT s_noisetimerval, 38'd
+                             CONSTANT s_pedal_on, 39'd               ; Bass-Flag Trigger für Hüllkurve
+                             CONSTANT s_midich, 40'd                 ; eingestellter MIDI-Kanal
+                             CONSTANT s_midi_1_ignoreflag, 41'd      ; MIDI-Datenempfang: System Commons und deren Daten ignorieren
+                             CONSTANT s_midi_2_ignoreflag, 42'd
+                             CONSTANT s_switches_old, 43'd           ; kommt als Bit 1 von Split_ON (0000 00X0)
+                             CONSTANT s_sustain_upr, 44'd
+                             CONSTANT s_sustain_lwr, 45'd
+                             ; 46 Dummy für Pedal, immer 0, nicht belegen!
+                             CONSTANT s_sosten_upr, 47'd             ; Empfangenes CC 64, Sostenuto aktiv
+                             CONSTANT s_sosten_lwr, 48'd
+                             ; 49 Dummy für Pedal, immer 0, nicht belegen!
+                             CONSTANT s_midi_localkey, 50'd          ; für local out, enthält aktuelle Taste einschließlich Offset
+                             CONSTANT s_midi_localdyn, 51'd
+                             CONSTANT s_pedal_noisecounter, 52'd
+                             CONSTANT s_old_contacts, 53'd           ; aktueller Tastenzustand
+                             CONSTANT s_lastkey_on, 54'd             ; letzte gedrückte Taste für Split
+                             CONSTANT s_clicklen, 55'd               ; Timer-Startwert
+                             CONSTANT s_last_key_velocity, 56'd
+                             ; CONSTANT s_temp_key, 57'd
+                             CONSTANT s_upper_localdyn, 58'd         ; gleichzeitig von ramread_X_scan gelesene Werte
+                             CONSTANT s_lower_localdyn, 59'd
+                             CONSTANT s_pedal_localdyn, 60'd
+                             CONSTANT s_upper_mididyn, 61'd          ; gleichzeitig von ramread_X_scan gelesene Werte
+                             CONSTANT s_lower_mididyn, 62'd
+                             CONSTANT s_pedal_mididyn, 63'd
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ; Register Renames
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+                             NAMEREG sF, midi_1_rxflag
+                             NAMEREG sE, midi_2_rxflag
+                             NAMEREG sD, midi_1_SysExFlag
+                             NAMEREG sC, midi_2_SysExFlag
+                             NAMEREG sB, midi_3_rxflag
+                             ; h�ufig benutzte Variablen
+                             NAMEREG sA, page_select                 ; Timer-Page c_page_xxx, 0..3=AutoInc-Timer, 4..15 = Scratch RAM
+                             NAMEREG s9, manual_select               ; aktuelles Manual, 0 = upper, 1 = lower, 2 = bass
+                             NAMEREG s8, s8_msb                      ; Zustand gedrückte Taste MIDI-Empfang, msb für Multiply
+                             NAMEREG s7, s7_lsb_spoint               ; Zustand gedrückte Taste eigene Manuale, lsb für Multiply
+                             NAMEREG s6, idx_ptr                     ; universeller Index-Zeiger
+                             NAMEREG s5, event_key
+                             NAMEREG s4, scan_number                 ; aktuelle Taste, Z�hler ab 0 bis Tastenanzahl
+                             NAMEREG s3, s3_key_status               ; Zustand gedrückte Taste Manual und allgemein
+                             ; s0, s1, s2 als Universal-Akkus
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+                 cold_start:
+                             ; Einsprungpunkt nach Laden des Scan Cores
+                             DISABLE INTERRUPT
+                             CALL port_init
+                             CALL scan_init
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+                             INPUT s0, SPI_MIDIOPT                   ; Bit 7 (MSB): USE SOST/SUSTAIN
+                             AND s0, 80
+                             JUMP NZ, main_loop
+                             LOAD s0, 00
+                             STORE s0, s_sustain_upr
+                             STORE s0, s_sustain_lwr
+                             STORE s0, s_sosten_upr
+                             STORE s0, s_sosten_lwr
+                             ; LOAD s0, E3                                 ; ##### TEST #####
+                             ; OUTPUT s0, SCAN_SR_PORT_DDR
+                  main_loop:
+                             CALL midi_dispatch                      ; MIDI-Daten empfangen? - ca. 1,7�s
+                             ; auf Scan-Freigabe durch Timer warten und neu setzen
+                             INPUT s0, SCANTIMER_ZERO                ; auf Scan-Freigabe warten
+                             COMPARE s0, 00                          ; warte auf 1-ms-Tick
+                             JUMP Z, main_loop
+                             CALL scan_wait_init                     ; Scan-Timer neu starten
+                             CALL scan_config                        ; Parameter-�nderungen? - ca. 3,4�s
+                             ; CALL handle_sustain_switches                ; Sustain/Sostenuto-Eingangspins
+                             ;
+                             CALL update_timers                      ; alle Timer updaten - ca. 53 �s
+                             CALL local_scan_manuals                 ; alle Manualtasten in RAM eintragen - ca. 340�s
+                             CALL midi_dispatch                      ; MIDI-Daten empfangen? - ca. 1,7 �s
+                             CALL event_handling                     ; ca. 580�s für 108 Tasten, 490�s für 96 Tasten
+                             JUMP main_loop
+                             ;
+                             ; ###############################################################################
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ; +++++++++++++++++++++ Scanboard-spezifischer Teil, +++++++++++++++++++++++++++
+                             ; +++++++++++++++++++++++++++++ Hauptschleife ++++++++++++++++++++++++++++++++++
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ; ###############################################################################
+                             ;
+                             ; Hilfsroutinen: Zubeh�r für Scan-Routinen, Initialisierungen
+                             ;
+                  port_init:
+                             ; Scan-Ports initialisieren
+                             LOAD s0, 3F                             ; für Fatar-/Opto-Interface
+                             OUTPUT s0, SCAN_FT_PORT_DDR
+                             LOAD s0, 00                             ; für Bass/Aux-Interface
+                             OUTPUT s0, SCAN_SR_PORT_DDR
+                             LOAD s0, 00                             ; Sustainpedal, alles Eing�nge
+                             OUTPUT s0, AUX_PORT_DDR
+                             ; hier: XB2-Tastatur-Reset
+                             CALL xb2_reset
+                             RETURN
+                             ;
+                             ;
+            clock_delay_255:
+                             LOAD s0, FF
+                             JUMP clock_delay_loop
+           clock_delay_long:
+                             LOAD s0, 1F
+                             JUMP clock_delay_loop
+          clock_delay_short:
+                             LOAD s0, 02
+                             JUMP clock_delay_loop
+                clock_delay: LOAD s0, 04
+           clock_delay_loop:
+                             SUB s0, 01
+                             JUMP NZ, clock_delay_loop
+                             RETURN
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+              sr_4014_clock:
+                             ; pos. Impuls auf SCAN_SR_Port Pin 1
+                             LOAD s0, 01
+                             OUTPUT s0, SR4014_CLK                   ; SR Clk
+                             CALL clock_delay                        ; s0 ist jetzt 0
+                             OUTPUT s0, SR4014_CLK
+                             RETURN
+               sr_4014_load:
+                             ; Parallele Daten der 4014-SR übernehmen
+                             LOAD s0, 01
+                             OUTPUT s0, SR4014_LOAD                  ; SR Data einlesen lassen
+                             CALL clock_delay_short
+                             CALL sr_4014_clock
+                             CALL clock_delay_short                  ; s0 ist jetzt 0
+                             OUTPUT s0, SR4014_LOAD
+                             RETURN
+                             ;
+               midi_tx_both:
+                             CALL midi_out_waitbuf                   ; benutzt s1!
+                             OUTPUT s0, MIDI_TX_1                    ; TX Midi auf beiden Ports
+                             OUTPUT s0, MIDI_TX_2
+                             LOAD s0, 00
+                             STORE s0, s_midi_activesensing          ; Active Sensing Reset
+                             RETURN
+                             ;
+                             ; ###############################################################################
+                             ; ############################### X B 2 / X B 5 #################################
+                             ; ###############################################################################
+                             ;
+                             ; Daten von XB2-Tastaturcontroller (TECHNICS) einsammeln.
+                             ; XB2 liefert nur gedrücktE Tasten, immer mit zugeh�riger ON-Dynamik (Timer-Wert).
+                             ; Speichern der gedrückten Tasten in RAM c_page_xb2data, Upper und Lower
+                             ; Nicht gedrückte Tasten bleiben im RAM = 0
+                             ;
+               xb2_keys2ram:
+                             ; zun�chst XB2-RAM komplett l�schen
+                             LOAD s0, 00
+                             OUTPUT s0, RAM_WRDATA                   ; zu schreibende Daten in s0
+                             LOAD scan_number, 00
+                             LOAD page_select, c_page_xb2data
+                             OUTPUT page_select, RAM_PAGE            ; MPX-RAM Page 0 = Tastenkontakte
+             xb2_erase_loop:
+                             ; Schleife zum L�schen des XB2-Scratchpads. Wird einmal vor der Tastaturabfrage
+                             ; ausgef�hrt. XB2 liefert nur gedrücktE Tasten mit zugeh�riger ON-Dynamik.
+                             OUTPUT scan_number, RAM_ADDR
+                             ADD scan_number, 01
+                             OUTPUT s0, UPPER_STROBE
+                             OUTPUT s0, LOWER_STROBE
+                             OUTPUT s0, PEDAL_STROBE
+                             COMPARE scan_number, c_maxkeys
+                             JUMP NZ, xb2_erase_loop
+                             ;
+                             ; nun gedrückte Tasten mit Dynamik eintragen, Rest des RAMs bleibt 0
+                             LOAD manual_select, 00                  ; XB2 Abfrage Upper
+                             LOAD s0, 01
+                             OUTPUT s0, K_ENAUPR
+                             CALL clock_delay_long
+                             CALL xb2_getkeys
+                             LOAD s0, 00
+                             OUTPUT s0, K_ENAUPR
+                             ;
+                             LOAD manual_select, 01                  ; XB2 Abfrage Lower
+                             LOAD s0, 01
+                             OUTPUT s0, K_ENALWR
+                             CALL clock_delay_long
+                             CALL xb2_getkeys
+                             LOAD s0, 00
+                             OUTPUT s0, K_ENALWR
+                             LOAD scan_number, 00
+                             RETURN
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+                xb2_getkeys:
+                             ; Tasten eines XB2-/XB5-Manuals einsammeln
+                             CALL xb2_wait_stb                       ; Warten auf K_STB = 1
+                             INPUT s0, K_EMPTY                       ; Empty-Bit (D6) gesetzt?
+                             COMPARE s0, 01
+                             RETURN Z                                ; nichts (mehr) gedrückt, beenden
+                             ;
+                             ; K_EMPTY war low, Daten sind abzuholen
+                             INPUT scan_number, K_DATA               ; 1. Datenbyte Tastennummer
+                             AND scan_number, 3F
+                             CALL xb2_send_ack                       ; ACK senden und auf K_STB = high warten
+                             ;
+                             INPUT s0, K_DATA                        ; 2. Datenbyte Timer, kleine Werte = schnell
+                             AND s0, 7F
+                             LOAD s3_key_status, 80                  ; 128 - Timer-Wert = Dynamik, jetzt in s1
+                             SUB s3_key_status, s0
+                             CALL xb2_send_ack                       ; ACK senden und auf K_STB = high warten
+                             ;
+                             ; Dynamik-Daten (s3_key_status) in XB2-RAM eintragen, PAGE ist noch richtig gesetzt
+                             OUTPUT s3_key_status, RAM_WRDATA        ; zu schreibende Daten in s3_key_status
+                             OUTPUT scan_number, RAM_ADDR
+                             LOAD idx_ptr, manual_select             ; 0 oder 1
+                             ADD idx_ptr, c_strobe_mask
+                             OUTPUT s0, (idx_ptr)                    ; Upper oder Lower Write Strobe
+                             JUMP xb2_getkeys                        ; weitere Tasten?
+                             ;
+               xb2_send_ack:
+                             ; K_ACK-Impuls senden und auf K_STB = high warten
+                             LOAD s0, 01
+                             OUTPUT s0, K_ACK
+                             CALL clock_delay_long
+                             LOAD s0, 00
+                             OUTPUT s0, K_ACK
+                             CALL clock_delay_long
+                             ; anschlie�end auf K_STB = 1 warten
+                             ;
+               xb2_wait_stb:
+                             ; Warten auf K_STB = 1
+                             INPUT s0, K_STB
+                             COMPARE s0, 01
+                             JUMP NZ, xb2_wait_stb
+                             CALL clock_delay
+                             RETURN
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+                  xb2_reset:
+                             LOAD s0, 00
+                             OUTPUT s0, K_ENAUPR
+                             OUTPUT s0, K_ENALWR
+                             OUTPUT s0, K_RST
+                             CALL clock_delay_255
+                             LOAD s0, 01
+                             OUTPUT s0, K_RST
+                             CALL clock_delay_255
+                             RETURN
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+               xb2_read_ram:
+                             ; Tastenzustand aus XB2-RAM lesen, Tasten-Adresse in scan_number
+                             OUTPUT scan_number, RAM_ADDR            ; Tastennummer in s0
+                             LOAD page_select, c_page_xb2data
+                             OUTPUT page_select, RAM_PAGE            ; MPX-RAM Page
+                             LOAD idx_ptr, manual_select             ; 0 oder 1
+                             ADD idx_ptr, c_read_mask
+                             INPUT s3_key_status, (idx_ptr)          ; Upper oder Lower Read
+                             RETURN                                  ; Dynamik in s3_key_status
+                             ;
+                             ;
+                             ; ###############################################################################
+                             ; ################################ SCAN LOOP ####################################
+                             ; ###############################################################################
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ; FATAR SCAN und PEDAL
+                             ; Inc 4024, Pin 1 (D0) - Key-Select innerhalb Gruppe, 0..7
+                             ; Reset 4024, Pin 2 (D1)
+                             ; Inc 4017, Pin 5 (D4) - Gruppen-Select 0..7
+                             ; Reset 4017, Pin 6 (D5)
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+         local_scan_manuals:
+                             ; Tastenzustand aktuelle Taste ermitteln und behandeln
+                             CALL sr_4014_load                       ; SR-Daten Pedal übernehmen
+                             CALL xb2_keys2ram                       ; Tasten von XB2-Controller einsammeln
+                             LOAD scan_number, 00
+            local_scan_loop:
+                             CALL local_scan_key                     ; derzeitigen Tastenzustand holen und eintragen
+                             CALL sr_4014_clock                      ; Pedal Puls für n�chste Taste
+                             ;
+                             ADD scan_number, 01                     ; n�chste Taste
+                             COMPARE scan_number, c_maxkeys          ; alle Tasten abgefragt?
+                             JUMP NZ, local_scan_loop
+                             RETURN
+                             ;
+                             ; ###############################################################################
+                             ; ############################### TASTENABFRAGE #################################
+                             ; ###############################################################################
+                             ;
+                             ; Split Mode:
+                             ; 0 = Pedal to Lower
+                             ; 1 = Lower to Upper
+                             ; 2 = Pedal to Upper
+                             ; 3 = Lower to Upper +1 Oktave
+                             ; 4 = Lower to Upper +2 Oktaven
+                             ;
+                             ; ###############################################################################
+                             ;
+             local_scan_key:
+                             CALL local_scan_transpose_key           ; gemeinsam für Upper/Lower/Pedal
+                             ; CALL clock_delay ; nicht bei XB2/XB5!
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ; UPPER-Taste holen
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+           local_scan_upper:
+                             LOAD manual_select, 00
+                             CALL xb2_read_ram                       ; hier aus RAM, XB2-Dynamik in s3_key_status
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+                             ; Tastenzustand jetzt in s3_key_status. Split-Modus ermitteln
+                             FETCH s0, s_split_on
+                             COMPARE s0, 00
+                             JUMP Z, local_scan_upper_unsplitted
+                             FETCH s0, s_splitmode
+                             COMPARE s0, 00
+                             JUMP Z, local_scan_upper_unsplitted     ; betrifft uns nicht, nur Lower
+   local_scan_upper_split_1:
+                             COMPARE s0, 01                          ; 1 = Lower to Upper
+                             JUMP NZ, local_scan_upper_split_2
+                             ; wenn unterhalb Splitpunkt, auf LOWER schreiben
+                             FETCH s0, s_splitpoint
+                             COMPARE scan_number, s0
+                             JUMP NC, local_scan_upper_unsplitted    ; JUMP wenn scan_number > splitpoint
+                             ; unterhalb Splitpunkt ausgef�hrt:
+                             CALL local_write_lower
+                             ; kein LOWER abfragen, w�rde RAM wieder l�schen
+                             JUMP local_scan_pedal                   ; PEDAL abfragen und RETURN
+                             ;
+   local_scan_upper_split_2:
+                             COMPARE s0, 02                          ; 2 = Pedal to Upper
+                             JUMP NZ, local_scan_upper_split_3
+                             ; wenn unterhalb Splitpunkt, auf PEDAL schreiben
+                             FETCH s0, s_splitpoint
+                             COMPARE scan_number, s0
+                             JUMP NC, local_scan_upper_unsplitted    ; JUMP wenn scan_number > splitpoint
+                             ; unterhalb Splitpunkt ausgef�hrt:
+                             ; kein LOWER und PEDAL abfragen, w�rde RAM wieder l�schen
+                             JUMP local_write_pedal                  ; und RETURN
+                             ;
+   local_scan_upper_split_3:
+                             COMPARE s0, 03                          ; 3 = Lower to Upper +1 Oktave
+                             JUMP NZ, local_scan_upper_split_4
+                             ; wenn unterhalb Splitpunkt, auf LOWER schreiben, 1 Oktave darüber
+                             FETCH s0, s_splitpoint
+                             COMPARE scan_number, s0
+                             JUMP NC, local_scan_upper_unsplitted    ; JUMP wenn scan_number > splitpoint
+                             ; unterhalb Splitpunkt ausgef�hrt:
+                             ADD scan_number, 12'd                   ; 1 Oktave addieren
+                             CALL local_scan_transpose_key
+                             CALL local_write_lower
+                             SUB scan_number, 12'd                   ; wieder auf alten Wert
+                             ; kein LOWER abfragen, w�rde RAM wieder l�schen. Weiter mit PEDAL
+                             JUMP local_scan_pedal                   ; PEDAL abfragen und RETURN
+                             ;
+   local_scan_upper_split_4:
+                             ; 4 = Lower to Upper +2 Oktaven
+                             ; wenn unterhalb Splitpunkt, auf LOWER schreiben, 2 Oktaven darüber
+                             FETCH s0, s_splitpoint
+                             COMPARE scan_number, s0
+                             JUMP NC, local_scan_upper_unsplitted    ; JUMP wenn scan_number > splitpoint
+                             ; unterhalb Splitpunkt ausgef�hrt:
+                             ADD scan_number, 24'd                   ; 1 Oktave addieren
+                             CALL local_scan_transpose_key
+                             CALL local_write_lower
+                             SUB scan_number, 24'd                   ; wieder auf alten Wert
+                             ; kein LOWER abfragen, w�rde RAM wieder l�schen. Weiter mit PEDAL
+                             JUMP local_scan_pedal                   ; PEDAL abfragen und RETURN
+                             ;
+local_scan_upper_unsplitted:
+                             ; Split ist OFF oder scan_number oberhalb Splitpunkt
+                             ; weiter mit normaler Reihenfolge
+          local_write_upper:
+                             LOAD manual_select, 00                  ; für MIDI OUTPUT Upper
+                             CALL local_states
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ; LOWER-Taste holen
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+           local_scan_lower:
+                             LOAD manual_select, 01
+                             CALL xb2_read_ram                       ; XB2-Dynamik in s3_key_status
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+                             ; Split-Modus ermitteln
+                             FETCH s0, s_split_on
+                             COMPARE s0, 00
+                             JUMP Z, local_scan_lower_unsplitted
+                             FETCH s0, s_splitmode
+                             ; LOWER nicht abfragen bei 1, 3, 4
+                             COMPARE s0, 01
+                             RETURN Z
+                             COMPARE s0, 03
+                             RETURN Z
+                             COMPARE s0, 04
+                             RETURN Z
+                             ; nur 0 = Pedal to Lower behandeln
+                             FETCH s0, s_splitpoint
+                             COMPARE scan_number, s0
+                             JUMP NC, local_scan_lower_unsplitted    ; JUMP wenn scan_number > splitpoint
+                             ; unterhalb Splitpunkt ausgef�hrt:
+                             JUMP local_write_pedal                  ; und RETURN
+                             ;
+local_scan_lower_unsplitted:
+                             ; Split ist OFF oder scan_number oberhalb Splitpunkt
+                             ; weiter mit normaler Reihenfolge
+                             CALL local_write_lower                  ;
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+           local_scan_pedal:
+                             RETURN                                  ; nur MIDI!
+                             COMPARE scan_number, c_maxbasskeys
+                             RETURN NC                               ; wenn scan_number > c_maxbasskeys
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ; PEDAL-Taste holen
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+                             INPUT s3_key_status, SR4014_DATA        ; Pedalkontakt
+                             XOR s3_key_status, 01                   ; ist jetzt 0 oder 1, keine Dynamik!
+                             LOAD s1, s3_key_status
+                             SL0 s1                                  ; 2. Kontakt simulieren
+                             OR s3_key_status, s1
+                             ;
+                             ; ------------------------------------------------------------------------------
+                             ;
+                             ; Zustand des gescannten Kontakts:
+                             ; 0 = OFF, 3 = ON
+          local_write_pedal:
+                             LOAD manual_select, 02                  ; für MIDI OUTPUT Pedal
+                             JUMP local_states                       ; Ende und zur�ck
+                             ;
+                             ; ------------------------------------------------------------------------------
+                             ;
+          local_write_lower:
+                             LOAD manual_select, 01                  ; für MIDI OUTPUT Lower
+                             JUMP local_states
+                             ;
+                             ; ------------------------------------------------------------------------------
+                             ;
+   local_scan_transpose_key:
+                             ; MIDI-Offset und Transponierwert setzen
+                             FETCH s1, s_keytranspose
+                             LOAD s0, scan_number
+                             ADD s0, s1
+                             ADD s0, c_midi_offset
+                             STORE s0, s_midi_localkey               ; wird für MIDI Send gebraucht
+                             RETURN
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ; State Machine für eigene Keyboard-Abfrage
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+               local_states:
+                             ; Zustand der State Machine holen
+                             CALL read_timerstate_s2                 ; setzt RAM_ADDR und RAM_PAGE auf c_page_timerstates
+                             ;
+                             ; -------------------------- Mealy-Zustandsautomat -----------------------------
+                             ;
+                             ; Entscheidet, ob MIDI gesendet werden muss
+                             ; hier vereinfacht für XB2, kennt nur zwei Zust�nde
+                             ; State in s2: c_state_on, c_state_off
+                             ;
+                             ; ------------------------------------------------------------------------------
+                             ;
+                             COMPARE s2, c_state_off
+                             JUMP Z, local_state_was_off
+                             ; JUMP local_state_was_on
+                             ;
+                             ; ----------------------- State "was on" oder "was off" ------------------------
+                             ;
+         local_state_was_on:
+                             ; XB2: Tastendynamik ist noch in s3_key_status!
+                             COMPARE s3_key_status, 00               ; immer noch ON?
+                             RETURN NZ                               ; nichts ge�ndert
+                             ; Taste war vorher ON, jetzt OFF, s3_key_status ist 0
+                             LOAD s2, c_state_off
+                             CALL write_ram_s2                       ; neuer State OFF
+                             JUMP local_send_midi
+                             ;
+        local_state_was_off:
+                             ; XB2: Tastendynamik ist noch in s3_key_status!
+                             COMPARE s3_key_status, 00               ; immer noch OFF?
+                             RETURN Z                                ; nichts ge�ndert
+                             ; Taste war vorher OFF, jetzt ON
+                             LOAD s2, c_state_on
+                             CALL write_ram_s2                       ; neuer State ON
+                             COMPARE manual_select, 02
+                             JUMP Z, local_send_on_pedal
+                             JUMP local_send_midi
+                             ;
+                             ;
+        local_send_on_pedal:
+                             LOAD s3_key_status, 3F                  ; Pedal hat keine Dynamik, nur 1 Bit (0) im RAM
+                             JUMP local_send_midi
+                             ;
+                             ; ------------------------------------------------------------------------------
+                             ;
+        write_timerstate_s2: ; zu schreibende Daten in s2, Taste in scan_number
+                             LOAD page_select, c_page_timerstates
+                             OUTPUT scan_number, RAM_ADDR
+                             OUTPUT page_select, RAM_PAGE            ; MPX-RAM Page
+               write_ram_s2: ; zu schreibende Daten in s2, Adresse und Page m�ssen gesetzt sein!
+                             OUTPUT s2, RAM_WRDATA
+                             LOAD idx_ptr, manual_select             ; 0 oder 1
+                             ADD idx_ptr, c_strobe_mask
+                             OUTPUT s2, (idx_ptr)                    ; Upper, Lower oder Pedal Strobe
+                             RETURN
+                             ;
+         read_timerstate_s2: ; zu holende Daten in s2, Taste in scan_number
+                             LOAD page_select, c_page_timerstates
+                             OUTPUT scan_number, RAM_ADDR            ; Tastennummer
+                             OUTPUT page_select, RAM_PAGE            ; MPX-RAM Page
+                read_ram_s2: ; zu holende Daten in s2, Adresse und Page m�ssen gesetzt sein!
+                             LOAD idx_ptr, manual_select             ; 0 oder 1
+                             ADD idx_ptr, c_read_mask
+                             INPUT s2, (idx_ptr)                     ; Timer-State dieser Taste in s2
+                             RETURN
+                             ;
+                             ; ------------------------------------------------------------------------------
+                             ; s_midi_localkey und s_midi_localdyn in 121er-RAM setzen und senden
+                             ; ------------------------------------------------------------------------------
+                             ;
+            local_send_midi:
+                             STORE s3_key_status, s_midi_localdyn
+                             CALL ramwrite_localdyn_121              ; s_midi_localdyn für aktuelles Manual schreiben, Taste in s_midi_localkey
+                             ; Manual in manual_select, On/Off-Dynamik INPUT s_midi_localdyn
+                             ; immer auch an SAM5504 dh. MIDI_TX_2 senden
+                             FETCH s0, s_midich                      ; eingestellter Kanal
+                             LOAD s1, manual_select                  ; Manual-Nummer addieren
+                             ADD s0, s1
+                             OR s0, 90
+                             CALL midi_tx_both
+                             FETCH s0, s_midi_localkey
+                             CALL midi_tx_both
+                             ;
+                             FETCH s0, s_midi_localdyn               ; gemessene Dynamik
+                             CALL midi_tx_both
+                             COMPARE s0, 00
+                             RETURN Z
+                             STORE s0, s_last_key_velocity           ; letzte gemessene Dynamik
+                             RETURN
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ; Multiplier 8x8 unsigned, s0 x s1, Ergebnis in msb und lsb, s0 wird nicht ver�ndert
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+             square_soft_s0: ; s0 squared => s8_msb,  s7_lsb_spoint
+                             LOAD s1, s0
+            mult_soft_s0_s1: ; s0 x s1 => s8_msb,  s7_lsb_spoint
+                             LOAD s8_msb, 00
+                             LOAD idx_ptr, 08
+                  mult_loop:
+                             SR0 s1
+                             JUMP NC, mult_shift
+                             ADD s8_msb, s0
+                 mult_shift:
+                             SRA s8_msb
+                             SRA s7_lsb_spoint
+                             SUB idx_ptr, 01
+                             JUMP NZ, mult_loop
+                             RETURN
+                             ;
+           load_s0_with_max: LOAD s0, FF
+                             RETURN
+                             ;
+                             ; ###############################################################################
+                             ; ################################# EVENT-LOOP ##################################
+                             ; #################### behandelt eigene und MIDI-IN-Events ######################
+                             ; ###############################################################################
+                             ;
+                             ; Variablen unabh�ngig von Scan-Routine benutzt
+                             ; scan_number: hier Adresse des MPX-RAMs,
+                             ; event_key: Adresse der 121-Tasten-RAMs
+                             ;
+             event_handling:
+                             LOAD s0, 00                             ; Start mit Taste 0
+                             STORE s0, s_keycount_upper
+                             STORE s0, s_keycount_lower
+                             STORE s0, s_keycount_pedal
+                             STORE s0, s_pedal_on                    ; Speicher für gedrückte Taste
+                             LOAD event_key, c_midi_firstkey         ; Start mit MIDI-Taste 12
+                             ;
+                 event_loop: ; ca. 450 �s Gesamtzeit
+                             CALL event_setcontacts
+                             ADD event_key, 01                       ; n�chste Taste
+                             COMPARE event_key, c_midi_lastkey       ; alle Tasten abgefragt?
+                             JUMP NZ, event_loop
+                             ;
+                             LOAD s0, 01
+                             OUTPUT s0, TEST_PORT                    ; normal ON
+                             FETCH s0, s_pedal_on
+                             OUTPUT s0, PEDAL_DOWN                   ; ist '1' wenn irgendeine Pedaltaste gedrückt ist
+                             ;
+                             ; Pedal-Click, simpel
+                             ;
+                             COMPARE s0, 00
+                             JUMP Z, event_loop_reset_pedalnoise     ; wenn kein Pedal gedrückt
+                             ;
+                             INPUT s1, SPI_CLICKLEN
+                             AND s1, 0F
+                             COMPARE s1, 00
+                             JUMP Z, event_loop_nopedalclick
+                             ADD s1, 04
+    event_loop_nopedalclick:
+                             FETCH s0, s_pedal_noisecounter
+                             COMPARE s0, s1
+                             JUMP Z, event_loop_pedal_noiseoff
+                             ADD s0, 01
+                             STORE s0, s_pedal_noisecounter
+                             INPUT s0, RND_NUMBER
+                             AND s0, 01
+                             OUTPUT s0, TEST_PORT                    ; normal ON
+                             RETURN
+                             ;
+event_loop_reset_pedalnoise:
+                             LOAD s0, 00
+                             STORE s0, s_pedal_noisecounter
+  event_loop_pedal_noiseoff:
+                             LOAD s0, 01
+                             OUTPUT s0, TEST_PORT                    ; normal ON
+                             RETURN
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ; Wird mit allen event_key-Tastennummern aufgerufen
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+          event_setcontacts:
+                             CALL event_rd_mididyn_121               ; 3 Bytes MIDI-Dynamik von event_key lesen
+                             CALL event_rd_localdyn_121              ; 3 Bytes Local-Dynamik von event_key lesen
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ; UPPER
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+                             LOAD manual_select, 00                  ; 0 = UPPER
+                             LOAD s3_key_status, 00
+                             FETCH s0, s_upper_mididyn
+                             CALL event_dyn2keystatus                ; Tastenzustand s0 danach mit s3_key_status verodert
+                             ; Local Enable-Bit UPPER gesetzt?
+                             INPUT s0, SPI_LOCALDISABLES
+                             TEST s0, 01
+                             JUMP NZ, event_ena_upper                ; Local überspringen, wenn ON
+                             ;
+                             FETCH s0, s_upper_localdyn
+                             CALL event_dyn2keystatus                ; Tastenzustand s0 danach mit s3_key_status verodert
+                             ;
+            event_ena_upper:
+                             CALL mpx_set_key
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ; LOWER
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+                             LOAD manual_select, 01                  ; 1 = LOWER
+                             LOAD s3_key_status, 00
+                             FETCH s0, s_lower_mididyn
+                             CALL event_dyn2keystatus                ; Tastenzustand s0 danach mit s3_key_status verodert
+                             ; Local Enable-Bit LOWER gesetzt?
+                             INPUT s0, SPI_LOCALDISABLES
+                             TEST s0, 02
+                             JUMP NZ, event_ena_lower                ; Local überspringen, wenn ON
+                             ;
+                             FETCH s0, s_lower_localdyn
+                             CALL event_dyn2keystatus                ; Tastenzustand s0 danach mit s3_key_status verodert
+                             ;
+            event_ena_lower:
+                             CALL mpx_set_key
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ; PEDAL
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+                             LOAD manual_select, 02                  ; 2 = PEDAL
+                             LOAD s3_key_status, 00
+                             FETCH s0, s_pedal_mididyn
+                             CALL event_dyn2keystatus                ; Tastenzustand s0 danach mit s3_key_status verodert
+                             ; Local Enable-Bit PEDAL gesetzt?
+                             INPUT s0, SPI_LOCALDISABLES
+                             TEST s0, 04
+                             JUMP NZ, event_ena_pedal                ; Local überspringen, wenn ON
+                             ;
+                             FETCH s0, s_pedal_localdyn
+                             CALL event_dyn2keystatus                ; Tastenzustand s0 danach mit s3_key_status verodert
+            event_ena_pedal:
+                             JUMP mpx_set_key
+                             ;
+                             ; Dynamik (in s0) in Tastenzustand übersetzen
+                             ; s3_key_status je nach Dynamik verodern mit 1 oder 3
+        event_dyn2keystatus:
+                             COMPARE s0, 00
+                             RETURN Z                                ; wenn Null, s3_key_status nicht �ndern
+                             OR s3_key_status, 01                    ; ist mindestens langsam
+                             COMPARE s0, c_dyn_threshold             ; Dynamikschwelle
+                             RETURN C                                ; war kleiner
+                             OR s3_key_status, 03                    ; ist schnell
+                             RETURN
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+      event_rd_localdyn_121:
+                             ; Local-Tastendynamik
+                             ; Taste in event_key, gelesene Dynamik danach in s_xxx_localdyn
+                             LOAD s0, event_key
+                             LOAD page_select, c_page_localdyn1
+                             CALL adjust_page_select
+                             OUTPUT s0, RAM_ADDR                     ; Tastennummer in s0
+                             OUTPUT page_select, RAM_PAGE            ; MPX-RAM Page
+                             LOAD s0, s0                             ; Delay!
+                             INPUT s0, RD_PEDAL
+                             STORE s0, s_pedal_localdyn
+                             INPUT s0, RD_LOWER
+                             STORE s0, s_lower_localdyn
+                             INPUT s0, RD_UPPER
+                             STORE s0, s_upper_localdyn
+                             RETURN                                  ; Zustand in s0
+                             ;
+       event_rd_mididyn_121:
+                             ; MIDI-Tastenzustand
+                             ; Taste in event_key, gelesene Daten sp�ter in s_xxx_mididyn
+                             LOAD s0, event_key
+                             LOAD page_select, c_page_midirx1
+                             CALL adjust_page_select
+                             OUTPUT s0, RAM_ADDR                     ; Tastennummer in s0
+                             OUTPUT page_select, RAM_PAGE            ; MPX-RAM Page
+                             LOAD s0, s0                             ; Delay!
+                             INPUT s0, RD_PEDAL
+                             STORE s0, s_pedal_mididyn
+                             INPUT s0, RD_LOWER
+                             STORE s0, s_lower_mididyn
+                             INPUT s0, RD_UPPER
+                             STORE s0, s_upper_mididyn
+                             RETURN                                  ; Zustand in s0
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ; für alle Manuale
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+                mpx_set_key:
+                             ; Offsets addieren, virtuelle Tastenkontakte setzen
+                             FETCH scan_number, s_gentranspose
+                             ADD scan_number, event_key
+                             COMPARE scan_number, c_gen_firstkey     ; Carry bei scan_number - 36?
+                             RETURN C                                ; Carry nicht gesetzt >=36
+                             COMPARE scan_number, c_gen_lastkey      ; Carry bei scan_number - 97?
+                             RETURN NC                               ; Carry nicht gesetzt >=36
+                             ; scan_number ist jetzt innerhalb 36..96
+                             SUB scan_number, c_midi_offset          ; -36
+                             ; scan_number ist jetzt innerhalb Generator-Bereich 0..60
+                             COMPARE manual_select, 02               ; Pedal?
+                             JUMP Z, mpx_pedal
+                             ; Letzten Kontakt-Zustand holen und merken. Wir verwenden diesen Wert
+                             ; auch gleich zum Ermitteln der tats�chlich eingeschalteten Tasten.
+                             CALL ramread_vcont_61
+                             STORE s0, s_old_contacts
+                             OR s0, s3_key_status
+                             RETURN Z                                ; nur wenn beide schon 0 sind
+                             COMPARE s0, 00                          ; alter Zustand vom letzen Durchlauf
+                             JUMP Z, mpx_onoff
+                             ; s_keycount_* bei tats�chlich klingenden Noten erh�hen
+                             LOAD idx_ptr, manual_select             ; 0 oder 1
+                             ADD idx_ptr, s_keycount_upper           ; Basisadresse
+                             FETCH s0, (idx_ptr)
+                             ADD s0, 01
+                             STORE s0, (idx_ptr)
+                             ; scan_number für Split merken, Taste is ON
+                             STORE scan_number, s_lastkey_on
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ; Zugriff auf die virtuellen Tastenkontakte
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+                  mpx_onoff:
+                             ; Sostenuto-Flag setzen, wenn SOSTENUTO aktiv und KEY ON
+                             COMPARE s3_key_status, 00
+                             JUMP Z, mpx_off                         ; wenn aktueller Zustand OFF
+                             FETCH s0, s_old_contacts                ; letzter Zustand
+                             COMPARE s0, 15'd
+                             RETURN Z                                ; ist bereits ganz an, nichts machen
+                             CALL mpx_changed
+                             COMPARE s3_key_status, 01
+                             JUMP Z, mpx_slow                        ; nur 1. Kontakt, slow inc
+                             JUMP mpx_fast                           ; 1. und/oder 2. Kontakt
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+                mpx_changed:
+                             ; Tastenkontaktzustand hat sich ge�ndert.
+                             ; Flag setzen, wenn Sostenuto-Pedal NICHT aktiv ist und Taste gedrückt wird.
+                             ; Die dann gedrückten Tasten werden beim Ausschalten übersprungen, d.h. bleiben an
+                             LOAD idx_ptr, manual_select             ; Sostenuto-Pedal für dieses Manual?
+                             ADD idx_ptr, s_sosten_upr
+                             FETCH s0, (idx_ptr)
+                             XOR s0, FF                              ; invertieren
+                             AND s0, s3_key_status
+                             ; s0 ist EIN, wenn Taste EIN und Sostenuto AUS
+                             CALL ramwrite_sostenutoflag_61
+                             RETURN
+                    mpx_off:
+                             FETCH s0, s_old_contacts                ; vorheriger Zustand
+                             COMPARE s0, 00
+                             RETURN Z                                ; ist bereits ganz aus, nichts machen
+                             ; Taste ist erstmals aus.
+                             LOAD idx_ptr, manual_select             ; Sostenuto-Pedal für dieses Manual?
+                             ADD idx_ptr, s_sosten_upr
+                             FETCH s0, (idx_ptr)
+                             COMPARE s0, 00
+                             JUMP Z, mpx_off_0                       ; Sostenuto ist aus
+                             CALL ramread_sostenutoflag_61
+                             COMPARE s0, 00
+                             ; die bei Sostenuto NICHT gedrückten Tasten beim Ausschalten überspringen
+                             RETURN NZ
+                  mpx_off_0:
+                             LOAD idx_ptr, manual_select             ; Sustain-Pedal für dieses Manual?
+                             ADD idx_ptr, s_sustain_upr
+                             FETCH s0, (idx_ptr)
+                             COMPARE s0, 00
+                             RETURN NZ                               ; nicht abschalten, Sustain ist aktiv
+                             CALL reset_noisetimer
+                             FETCH s0, s_old_contacts
+                             AND s0, 0F                              ; Noise wegmaskieren
+                             LOAD s1, s0                             ; Steady wird jetzt Noise
+                             SL0 s1                                  ; altes Steady-Nibble in oberes Noise-Nibble verschieben
+                             SL0 s1
+                             SL0 s1
+                             SL0 s1
+                             AND s1, 70                              ; Noise ohne MSBit (RFU)
+                             SR0 s0                                  ; Steady-Zustand halbieren, immer halber Pegel
+                             INPUT s2, SPI_CLICKLEN
+                             AND s2, 0F
+                             COMPARE s2, 05                          ; A < B -> C set, A >= B -> C cleared
+                             CALL C, mpx_clear_s1                    ; ist kleiner als 5, dann Noise sofort l�schen
+                             ; Steady- (s0) und Noise-Anteil (s1) in mpx-RAM schreiben
+                             ; Tastennnummer in scan_addr
+                             ; in manual_select ist aktuell abgefragtes Manual
+                             OR s0, s1
+                             JUMP ramwrite_vcont_61
+                             ;
+               mpx_clear_s1:
+                             LOAD&RETURN s1, 00                      ; KeyOff-Noise l�schen wenn ClickLen < 8
+                             ;
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ; Differenzierter Key ON-Click
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+                             ; Verhalten Tastenkontakt-Bits nach Dekodierung ABC -> Kontakte aus obiger Tabelle
+                             ; noise_bb_bit  steady_bb_bit  level_full_bit  Resultat
+                             ; 0             0              0               OFF
+                             ; 1             0              0               HALF NOISE
+                             ; 0             1              0               HALF STEADY
+                             ; 1             1              0               HALF NOISE, HALF STEADY
+                             ; 0             0              1               OFF
+                             ; 1             0              1               FULL NOISE
+                             ; 0             1              1               FULL STEADY
+                             ; 1             1              1               FULL STEADY
+                             ;
+                   mpx_fast:
+                             ; Schneller Tastenanschlag, zweiter Kontakt geschlossen, voll gedrückt
+                             INPUT s0, SPI_CONFIG_1                  ; Lubed Contacts?
+                             TEST s0, 02                             ; AND -> Z-Flag (Bit 1 gesetzt?)
+                             JUMP NZ, mpx_fast_lubed                 ; Wenn Lubed Contacts Bit ON
+                             ;
+               mpx_fast_dry:
+                             ; Dry Contact, harter Klick: Erst halfnoise, dann fullnoise, dann halfnoise_halfon, dann ON
+                             CALL start_noisetimer_fastkey           ; ggf. starten, falls noch in Ruhe; aktueller noisetimer in s0
+                             COMPARE s0, FF                          ; Klick beendet, d.h. Timer abgelaufen?
+                             JUMP Z, mpx_fullon
+                             FETCH s2, s_clicklen
+                             SR1 s2                                  ; neg. Wert halbieren = Half-Click-L�nge in s2
+                             ;SR1 s2                                 ; neg. Wert nochmals halbieren = Quarter-Click-L�nge in s2
+                             COMPARE s0, s2                          ; Timer-Wert noch in s0, Quarter-Click-L�nge in s2
+                             JUMP NC, mpx_halfnoise_halfon           ; JUMP wenn Timer-Wert in s0 > s2, Klick kurz vor Ende?
+                             ;FETCH s2, s_clicklen
+                             ;SR1 s2                                  ; neg. Wert halbieren = halbe Click-L�nge jetzt in s2
+                             ;COMPARE s0, s2                          ; Timer-Wert noch in s0, Half-Click-L�nge in s2
+                             ;JUMP NC, mpx_fullnoise                  ; JUMP wenn Timer-Wert in s0 > s2, Klick halb beendet?
+                             ;JUMP mpx_halfnoise
+                             JUMP mpx_fullnoise
+                             ;
+             mpx_fast_lubed:
+                             ; Lubed Contact, weicherer Klick, wie mpx_slow, aber l�ngere Zeit
+                             CALL start_noisetimer_fastkey           ; ggf. starten, falls noch in Ruhe; aktueller noisetimer in s0
+                             JUMP mpx_checkhalf
+                             ;
+                   mpx_slow:
+                             ; Langsamer Tastenanschlag oder nur erster Kontakt geschlossen
+                             CALL start_noisetimer_slowkey           ; ggf. starten, falls noch in Ruhe; aktueller noisetimer in s0
+              mpx_checkhalf:
+                             COMPARE s0, FF                          ; Klick beendet, d.h. Timer abgelaufen?
+                             JUMP Z, mpx_fullon
+                             ; Wenn H�lfte der Klick-L�nge erreicht, auf halfnoise_halfon umschalten
+                             FETCH s2, s_clicklen
+                             SR1 s2                                  ; neg. Wert halbieren = halbe Click-L�nge jetzt in s2
+                             COMPARE s0, s2                          ; Timer-Wert in s0, Half-Click-L�nge in s2
+                             JUMP NC, mpx_halfnoise_halfon           ; JUMP wenn Timer-Wert in s0 > s2, Klick halb beendet?
+                             ; JUMP mpx_halfnoise
+              mpx_halfnoise:
+                             LOAD s0, 70                             ; half level, steady_bb_bits OFF, all noise, noise_bb_bits ON
+                             JUMP ramwrite_vcont_61
+              mpx_fullnoise:
+                             LOAD s0, 78                             ; full level, steady_bb_bits OFF, all noise, noise_bb_bits ON
+                             JUMP ramwrite_vcont_61
+                 mpx_halfon:
+                             LOAD s0, 07                             ; half level, steady_bb_bits ON
+                             JUMP ramwrite_vcont_61
+       mpx_halfnoise_halfon:
+                             LOAD s0, 77                             ; half level, steady_bb_bits ON, half noise, noise_bb_bits ON
+                             JUMP ramwrite_vcont_61
+                 mpx_fullon:
+                             LOAD s0, 0F                             ; full level, steady_bb_bits ON,  no noise, noise_bb_bits OFF
+                             JUMP ramwrite_vcont_61
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+                  mpx_pedal:
+                             ; kleine Sonderbehandlung für Pedal, hat keine Dynamik und keine Noise-Bits:
+                             ; s3_key_status enth�lt 0 (Taste aus) oder anderen Wert (Taste an),
+                             ; Falls sich neue Taste ge�ndert hat, alte Taste l�schen
+                             ; Vorher gespielte Pedaltaste l�schen, Nummer der neue Pedaltaste merken
+                             ; manual_select enth�lt 2
+                             COMPARE s3_key_status, 00
+                             JUMP Z, mpx_pedal_0                     ; Taste ist aus wenn 0
+                             LOAD s3_key_status, 01                  ; nur zwei Zust�nde zulassen, hier ON
+                             FETCH s0, s_pedal_on                    ; Speicher für gedrückte Taste
+                             OR s0, s3_key_status
+                             STORE s0, s_pedal_on                    ; kann innerhalb Pedalschleife '1' werden
+                mpx_pedal_0:
+                             ; get_state/set_state hier nicht ben�tigt, weil kein Noise ber�cksichtigt wird
+                             LOAD s0, s3_key_status
+                             JUMP ramwrite_vcont_61                  ; Taste INPUT scan_number, Zustand INPUT s0
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ; Werte INPUT MPX/Scratch-RAM setzen mit aktuellem manual_select und scan_number
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+         adjust_page_select:
+                             COMPARE s0, 40                          ; ist auf zwei Seiten aufgeteilt
+                             RETURN C                                ; wenn kleiner 63, nicht addieren
+                             SUB s0, 40
+                             ADD page_select, 01
+                             RETURN
+                             ;
+   ramread_sostenutoflag_61:
+                             ; Sostenuto-Flag
+                             ; Taste in scan_number, gelesene Daten sp�ter in s0
+                             LOAD page_select, c_page_sostenutoflags
+                             JUMP ramread_61
+           ramread_vcont_61: ; Virtuelle Tastenkontakte
+                             ; Taste in scan_number, gelesene Daten sp�ter in s0
+                             LOAD page_select, c_page_vcontacts
+                 ramread_61:
+                             ; Taste in scan_number, gelesene Daten sp�ter in s0
+                             LOAD s0, scan_number
+                 ramread_s0:
+                             ; Tasten-Adresse INPUT s0
+                             OUTPUT s0, RAM_ADDR                     ; Tastennummer in s0
+                             OUTPUT page_select, RAM_PAGE            ; MPX-RAM Page
+                             LOAD idx_ptr, manual_select             ; 0 oder 1
+                             ADD idx_ptr, c_read_mask
+                             INPUT s0, (idx_ptr)                     ; Upper, Lower oder Pedal Read
+                             RETURN                                  ; Zustand in s0
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                ramwrite_s0:
+                             ; Tasten-Adresse INPUT s0
+                             OUTPUT s0, RAM_ADDR
+                             OUTPUT page_select, RAM_PAGE            ; MPX-RAM Page
+                             LOAD idx_ptr, manual_select             ; 0 oder 1
+                             ADD idx_ptr, c_strobe_mask
+                             OUTPUT s0, (idx_ptr)                    ; Upper, Lower oder Pedal Strobe
+                             RETURN
+                             ;
+                             ;
+      ramwrite_localdyn_121:
+                             ; Scanned-RAM Dynamik
+                             ; Taste in s_midi_localkey, s_midi_localdyn und manual_select
+                             LOAD page_select, c_page_localdyn1
+                             FETCH s0, s_midi_localdyn               ; Dynamik dieser Taste
+                             OUTPUT s0, RAM_WRDATA                   ; zu schreibende Dynamik in s0
+                             FETCH s0, s_midi_localkey               ; Local-Key in s0, geht von 12 bis 121
+                             CALL adjust_page_select
+                             JUMP ramwrite_s0
+                             ;
+          ramwrite_midi_121:
+                             ; Empfangsdaten, MIDI-Taste/Dynamik s_midi_data1, s_midi_data2 und manual_select ins RAM, 12..121
+                             LOAD page_select, c_page_midirx1
+                             FETCH s0, s_midi_data2                  ; Dynamik dieser Taste
+                             OUTPUT s0, RAM_WRDATA                   ; zu schreibende Dynamik in s0
+                             FETCH s0, s_midi_data1                  ; MIDI-Key in s0, geht von 12 bis 121
+                             CALL adjust_page_select
+                             JUMP ramwrite_s0
+                             ;
+  ramwrite_sostenutoflag_61:
+                             ; zu schreibende Daten in s0
+                             LOAD page_select, c_page_sostenutoflags
+                             JUMP ramwrite_61
+          ramwrite_vcont_61:
+                             ; zu schreibende Daten in s0
+                             LOAD page_select, c_page_vcontacts
+                ramwrite_61:
+                             ; zu schreibende Daten in s0, page_select muss gesetzt sein, 0..61
+                             OUTPUT s0, RAM_WRDATA
+                             LOAD s0, scan_number
+                             JUMP ramwrite_s0
+                             ;
+                             ; ##############################################################################
+                             ; Hilfsroutinen: Werte in Timer/Scratch-RAM lesen oder schreiben
+                             ; manual_select = 0 für Upper, manual_select = 1 für Lower Manual
+                             ; ##############################################################################
+                             ;
+   start_noisetimer_fastkey:
+                             ; Noise-Timer der aktuellen Taste starten, sofern nicht bereits geschehen
+                             CALL get_noisetimer
+                             STORE s0, s_noisetimerval
+                             COMPARE s0, 00
+                             RETURN NZ                               ; wenn bereits gestartet
+                             ;
+                             INPUT s1, RND_NUMBER                    ; zuf�llige L�nge
+                             AND s1, 03                              ; 0 bis 3
+                             FETCH s0, s_clicklen                    ; Timer-Startwert,  237..252
+                             SUB s0, s1                              ; um Zufallswert verl�ngern
+                             JUMP set_noisetimer
+                             ;
+   start_noisetimer_slowkey:
+                             ; Noise-Timer der aktuellen Taste starten, sofern nicht bereits geschehen
+                             CALL get_noisetimer
+                             STORE s0, s_noisetimerval
+                             COMPARE s0, 00
+                             RETURN NZ                               ; wenn bereits gestartet
+                             ;
+                             INPUT s1, RND_NUMBER                    ; zuf�llige L�nge
+                             AND s1, 01                              ; 0 oder 1
+                             FETCH s0, s_clicklen                    ; Timer-Startwert,  237..255
+                             SR1 s0                                  ; Timer-Startwert verdoppelt,  246..255
+                             SUB s0, s1                              ; um kleinen Zufallswert verl�ngern
+             set_noisetimer:
+                             LOAD page_select, c_page_noisetimer
+                             JUMP ramwrite_61
+           reset_noisetimer:
+                             LOAD s0, 00
+                             JUMP set_noisetimer
+             get_noisetimer:
+                             LOAD page_select, c_page_noisetimer
+                             JUMP ramread_61
+                             ;
+                             ; ##############################################################################
+                             ; Dynamik- und Noise-Timer für beide Manuale aktualisieren
+                             ; ge�ndert für neues MPX-RAM ohne Autoinkrement-Timer, 20.03.2014
+                             ; wird einmal pro Scan-Durchlauf aufgerufen, dauert ca. 52 �s
+                             ; ##############################################################################
+              update_timers:
+                             ;LOAD page_select, c_page_dyntimer
+                             ;OUTPUT page_select, RAM_PAGE            ; MPX-RAM Page Dynamik-Timer
+                             ;LOAD scan_number, 00
+                             ;CALL update_timer_loop
+                             LOAD page_select, c_page_noisetimer
+                             OUTPUT page_select, RAM_PAGE            ; MPX-RAM Page Noise-Timer
+                             LOAD scan_number, 00
+          update_timer_loop:
+                             OUTPUT scan_number, RAM_ADDR
+                             ADD scan_number, 01
+                             INPUT s0, RD_UPPER
+                             COMPARE s0, 00
+                             JUMP Z, update_timer_done1              ; noch nicht gestartet
+                             COMPARE s0, FF
+                             JUMP Z, update_timer_done1              ; bereits abgelaufen
+                             ADD s0, 01
+                             OUTPUT s0, RAM_WRDATA                   ; zu schreibende Daten in s0
+                             LOAD s0, 00                             ; NOP
+                             OUTPUT s0, UPPER_STROBE
+                             LOAD s0, 00                             ; NOP
+         update_timer_done1:
+                             INPUT s0, RD_LOWER
+                             COMPARE s0, 00
+                             JUMP Z, update_timer_done2              ; noch nicht gestartet
+                             COMPARE s0, FF
+                             JUMP Z, update_timer_done2              ; bereits abgelaufen
+                             ADD s0, 01
+                             OUTPUT s0, RAM_WRDATA                   ; zu schreibende Daten in s0
+                             LOAD s0, 00                             ; NOP
+                             OUTPUT s0, LOWER_STROBE
+         update_timer_done2:
+                             COMPARE scan_number, 64'd
+                             JUMP NZ, update_timer_loop
+                             RETURN
+                allnotesoff:
+                             ; alle T�ne, Flags und Timer l�schen
+                             LOAD s0, 00
+                             OUTPUT s0, RAM_WRDATA                   ; Enables und Werte auf 0
+                             OUTPUT s0, PEDAL_DOWN
+                             LOAD scan_number, 00
+                             LOAD page_select, 00
+           allnotesoff_loop:
+                             OUTPUT scan_number, RAM_ADDR
+                             OUTPUT page_select, RAM_PAGE
+                             OUTPUT s0, UPPER_STROBE
+                             OUTPUT s0, LOWER_STROBE
+                             OUTPUT s0, PEDAL_STROBE
+                             ADD scan_number, 01
+                             COMPARE scan_number, 64'd               ; 64 Durchl�ufe?
+                             JUMP NZ, allnotesoff_loop
+                             LOAD scan_number, 00
+                             ADD page_select, 01
+                             COMPARE page_select, 16'd               ; 16 Durchl�ufe?
+                             JUMP NZ, allnotesoff_loop
+                             RETURN                                  ; fertig
+                             ;
+             start_dyntimer:
+                             ; Dynamik-Timer der aktuellen Taste starten, wenn nicht bereits geschehen
+                             LOAD page_select, c_page_dyntimer
+                             CALL ramread_61
+                             COMPARE s0, 00
+                             RETURN NZ                               ; wenn bereits gestartet
+                             LOAD s0, 01                             ; Timer starten, z�hlt aufw�rts
+                             JUMP ramwrite_61
+             reset_dyntimer:
+                             LOAD s0, 00                             ; Timer stoppen
+                             LOAD page_select, c_page_dyntimer
+                             JUMP ramwrite_61
+               get_dyntimer:
+                             LOAD page_select, c_page_dyntimer
+                             JUMP ramread_61
+                             ;
+                             ;
+                             ; ##############################################################################
+                             ; ################## M I D I   R E C E I V E   DISPATCHER ######################
+                             ; ##############################################################################
+                             ;
+                             ;
+                             ; MIDI-Subroutinen für MIDI-Empfang
+                             ; Dispatcher stellt fest, ob und was es zu tun gibt
+                             ; wird regelm��ig aus Hauptschleife aufgerufen
+                             ;
+              midi_dispatch:
+       midi_dispatch_loop_1:
+                             INPUT s0, MIDI_IN1_STATUS
+                             COMPARE s0, 00                          ; Daten empfangen?
+                             JUMP Z, midi_dispatch_loop_2            ; wenn nein, weiter mit MIDI In 2 (SAM/USB)
+                             CALL midi_1_receive                     ; Buffer lesen/leeren, Realtime filtern, Flags setzen
+                             COMPARE midi_1_rxflag, 00
+                             CALL NZ, midi_dispatch_1                ; interpretieren, falls komplett
+                             JUMP midi_dispatch_loop_1
+                             ;
+       midi_dispatch_loop_2:
+                             INPUT s0, MIDI_IN2_STATUS
+                             COMPARE s0, 00                          ; Daten empfangen?
+                             JUMP Z, midi_dispatch_loop_3            ; wenn nein, weiter mit MIDI In 3 (AVR)
+                             CALL midi_2_receive                     ; Buffer leeren
+                             COMPARE midi_2_rxflag, 00
+                             CALL NZ, midi_dispatch_2                ; interpretieren, falls komplett
+                             JUMP midi_dispatch_loop_2
+                             ;
+       midi_dispatch_loop_3:
+                             INPUT s0, MIDI_AVR_STATUS
+                             AND s0, 0E                              ; Daten empfangen?
+                             RETURN Z                                ; wenn nein, zur�ck zur Main Loop
+                             CALL midi_3_receive                     ; Buffer lesen/leeren, Flags setzen
+                             COMPARE midi_3_rxflag, 00
+                             CALL NZ, midi_dispatch_3                ; interpretieren, falls komplett
+                             JUMP midi_dispatch_loop_3
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ; Daten auswerten, hier kein SysEx mehr
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+            midi_dispatch_1:
+                             ; Daten vom erstem MIDI-Eingang interpretieren, falls vollst�ndig
+                             LOAD midi_1_rxflag, 00                  ; Rx-Flag l�schen
+                             FETCH s0, s_midi_1_cmd                  ; von IRQ gesetzte Bytes
+                             STORE s0, s_midi_cmd
+                             FETCH s0, s_midi_1_data1
+                             STORE s0, s_midi_data1
+                             FETCH s0, s_midi_1_data2
+                             STORE s0, s_midi_data2
+                             FETCH s0, s_midi_1_len
+                             STORE s0, s_midi_len
+                             JUMP midi_dispatch_all                  ; Ende und RETURN
+                             ;
+            midi_dispatch_2:
+                             ; Daten vom zweiten MIDI-Eingang interpretieren, falls vollst�ndig
+                             LOAD midi_2_rxflag, 00                  ; Rx-Flag l�schen
+                             FETCH s0, s_midi_2_cmd                  ; von IRQ gesetzte Bytes
+                             STORE s0, s_midi_cmd
+                             FETCH s0, s_midi_2_data1
+                             STORE s0, s_midi_data1
+                             FETCH s0, s_midi_2_data2
+                             STORE s0, s_midi_data2
+                             FETCH s0, s_midi_2_len
+                             STORE s0, s_midi_len
+                             JUMP midi_dispatch_all                  ; Ende und RETURN
+                             ;
+            midi_dispatch_3:
+                             ; bei AVR  Controller Change nur auf ALL NOTES OFF pr�fen, sonst senden
+                             LOAD midi_3_rxflag, 00                  ; Rx-Flag l�schen
+                             FETCH s0, s_midi_3_cmd
+                             AND s0, F0
+                             COMPARE s0, B0                          ; Control Change?
+                             JUMP NZ, midi_dispatch_3_send
+                             FETCH s0, s_midi_3_cmd
+                             AND s0, 0F                              ; Kanal isolieren
+                             STORE s0, s_midi_chan_masked            ; für allnotesoff_manual
+                             FETCH s0, s_midi_3_data1
+                             COMPARE s0, 123'd                       ; All Notes OFF?
+                             JUMP Z, allnotesoff_manual
+       midi_dispatch_3_send:
+                             ; empfangenen Datensatz 1 bis 3 Bytes vom AVR an SAM und DIN-Buchse senden
+                             FETCH s0, s_midi_3_cmd
+                             CALL midi_tx_both
+                             FETCH s0, s_midi_3_len
+                             COMPARE s0, 00
+                             RETURN Z
+                             ;
+                             FETCH s0, s_midi_3_data1
+                             CALL midi_tx_both
+                             FETCH s0, s_midi_3_len
+                             COMPARE s0, 01
+                             RETURN Z
+                             ;
+                             FETCH s0, s_midi_3_data2
+                             JUMP midi_tx_both
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+          midi_dispatch_all:
+                             ; MIDI-Datensatz vollst�ndig, dekodieren und ggf. RAM beschreiben
+                             CALL midi_out2_waitbuf                  ; SAM5504-Buffer aufnahmebereit?
+                             FETCH s1, s_midi_len
+                             FETCH s0, s_midi_cmd
+                             OUTPUT s0, MIDI_TX_2                    ; immer alles an SAM5504 senden
+                             COMPARE s1, 00
+                             JUMP Z, midi_dispatch_all_0
+                             FETCH s0, s_midi_data1
+                             OUTPUT s0, MIDI_TX_2
+                             COMPARE s1, 01
+                             JUMP Z, midi_dispatch_all_0
+                             FETCH s0, s_midi_data2
+                             OUTPUT s0, MIDI_TX_2
+        midi_dispatch_all_0:
+                             FETCH s0, s_midi_cmd
+                             AND s0, 0F                              ; Kanal isolieren
+                             STORE s0, s_midi_chan_masked
+                             FETCH s0, s_midi_cmd
+                             AND s0, F0                              ; Befehl isolieren
+                             STORE s0, s_midi_cmd_masked
+                             ;
+                             LOAD manual_select, 00                  ; Default upper
+                             FETCH s1, s_midi_chan_masked
+                             FETCH s0, s_midich                      ; eingestellter Kanal, Piano-Maske
+                             COMPARE s1, s0                          ; eingestellter gleich empfangener Kanal?
+                             JUMP Z, midi_dispatch_all_onoff         ; mit manual_select = 0, upper
+                             ;
+                             ADD s0, 01
+                             LOAD manual_select, 01
+                             COMPARE s1, s0                          ; eingestellter Kanal +1?
+                             JUMP Z, midi_dispatch_all_onoff
+                             ;
+                             ADD s0, 01
+                             LOAD manual_select, 02                  ; mit manual_select = 2, Pedal
+                             COMPARE s1, s0                          ; eingestellter Kanal +2?
+                             JUMP Z, midi_dispatch_pedal
+                             ;
+                             ; Sonderkanal +3 für Touchpad-CC, nur an AVR
+                             ADD s0, 01
+                             COMPARE s1, s0                          ; eingestellter Kanal +3?
+                             JUMP Z, midi_to_avr
+                             RETURN
+                             ;
+                             ; Pedal-Sonderbehandlung, weil nur ein Bit statt ein Byte abgespeichert wird
+                             ;
+        midi_dispatch_pedal:
+                             FETCH s0, s_midi_cmd_masked
+                             COMPARE s0, 80
+                             JUMP Z, midi_dispatch_all_off           ; 0 speichern
+                             COMPARE s0, 90
+                             JUMP NZ, midi_dispatch_rest             ; wenn kein ON/OFF
+                             ;
+                             FETCH s0, s_midi_data2
+                             COMPARE s0, 00
+                             JUMP Z, midi_dispatch_all_off           ; war $90 mit Dynamik 0
+                             ;
+                             LOAD s0, 01
+                             STORE s0, s_midi_data2
+                             JUMP midi_dispatch_all_write
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+    midi_dispatch_all_onoff:
+                             ; MIDI-NoteOn/NoteOff-Befehle? Dynamik bereits in s2, Manual in manual_select
+                             FETCH s0, s_midi_cmd_masked
+                             COMPARE s0, 90
+                             JUMP Z, midi_dispatch_all_write
+                             COMPARE s0, 80
+                             JUMP NZ, midi_dispatch_rest             ; wenn kein ON/OFF
+                             ; ist ein ON/OFF-Befehl
+      midi_dispatch_all_off:
+                             LOAD s0, 00                             ; MIDI-Befehl Taste OFF, Dynamik 0
+                             STORE s0, s_midi_data2                  ; Dynamik dieser Taste 0
+    midi_dispatch_all_write:
+                             ; jetzt Notenwert und Dynamik abspeichern
+                             ; Dynamik ist 0 bei Key-Off-Befehl
+                             CALL midi_adjust_foldbacks              ; Sollte abschaltbar sein!
+                             JUMP ramwrite_midi_121
+                             ;
+                             ; MIDI-Tasten au�erhalb des 5-Oktaven-Umfangs oktavweise verschieben
+                             ;
+      midi_adjust_foldbacks:
+                             FETCH s0, s_midi_data1
+    midi_adjust_foldbacks_1:
+                             COMPARE s0, c_gen_firstkey              ; Carry bei scan_number - 36?
+                             JUMP NC, midi_adjust_foldbacks_2        ; Carry nicht gesetzt >=36
+                             ADD s0, 12'd
+                             JUMP midi_adjust_foldbacks_1
+                             ;
+    midi_adjust_foldbacks_2:
+                             STORE s0, s_midi_data1
+                             COMPARE s0, c_gen_lastkey               ; Carry bei scan_number - 97?
+                             RETURN C
+                             SUB s0, 12'd
+                             JUMP midi_adjust_foldbacks_2
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+         midi_dispatch_rest:
+                             ; Program Change und Controller? Dann an AVR
+                             COMPARE s0, C0
+                             JUMP Z, midi_to_avr
+                             COMPARE s0, E0
+                             JUMP Z, midi_to_avr
+                             COMPARE s0, B0
+                             RETURN NZ                               ; alles andere unber�cksichtigt
+               midi_cchange:
+                             ; bei Controller Change auf ALL NOTES OFF pr�fen, dann weiter wie Program Change
+                             FETCH s0, s_midi_data1
+                             COMPARE s0, 123'd                       ; All Notes OFF?
+                             JUMP Z, allnotesoff_manual              ; falls nicht, weiter mit AVR-IRQ
+                             ;
+                midi_to_avr:
+                             ; AVR-IRQ ausl�sen; MIDI-Daten an SPI
+                             FETCH s0, s_midi_cmd
+                             OUTPUT s0, MIDI_CMD
+                             FETCH s1, s_midi_data1                  ; s1 wird gleich weiterbenutzt
+                             OUTPUT s1, MIDI_DB1
+                             FETCH s0, s_midi_data2
+                             OUTPUT s0, MIDI_DB2
+                             CALL midi_strobe_avr                    ; an AVR senden, benutzt s0
+                             ;
+                             FETCH s0, s_midi_cmd_masked
+                             COMPARE s0, B0                          ; Control Change empfangen?
+                             RETURN NZ
+                             ; ab hier nur noch Control Change Bx, auf allen benutzten Kan�len
+                             ;
+                             INPUT s0, SPI_MIDIOPT                   ; Bit 7 (MSB): USE SOST/SUSTAIN freigeschaltet?
+                             AND s0, 80
+                             RETURN Z                                ; wenn 0, dann nicht behandeln, abgeschaltet
+                             ;
+               midi_sustain:
+                             ; manual_select enth�lt empfangenes Ziel (0, 1 oder 2)
+                             COMPARE s1, 40
+                             JUMP NZ, midi_sustain_sostenuto
+                             ;
+                             LOAD idx_ptr, s_sustain_upr
+                             JUMP midi_sustain_1                     ; evt. von SAM5504-HW-Input, muss auch gesendet werden
+                             ;
+     midi_sustain_sostenuto:
+                             COMPARE s1, 42
+                             RETURN NZ
+                             LOAD idx_ptr, s_sosten_upr
+             midi_sustain_1:
+                             ADD idx_ptr, manual_select
+                             FETCH s2, s_midi_data2
+                             STORE s2, (idx_ptr)
+                             ; OUTPUT s0, AUXPORT                    ; ### TEST - nur in MIDI-Scantreiber benutzen! ###
+                             ;
+                             ; Sustain und Sostenuto weitersenden, k�nnte vom DSP (Eingangs-Pins über Jumper) stammen
+                             CALL midi_out_waitbuf                   ; benutzt s1!
+                             FETCH s0, s_midi_cmd
+                             OUTPUT s0, MIDI_TX_1                    ; TX Midi auf DIN-Buchse
+                             FETCH s0, s_midi_data1
+                             OUTPUT s0, MIDI_TX_1                    ; TX Midi auf DIN-Buchse
+                             FETCH s0, s_midi_data2
+                             OUTPUT s0, MIDI_TX_1                    ; TX Midi auf DIN-Buchse
+                             RETURN
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+         allnotesoff_manual:
+                             LOAD s0, 00
+                             STORE s0, s_sustain_upr
+                             STORE s0, s_sustain_lwr
+                             STORE s0, s_sosten_upr
+                             STORE s0, s_sosten_lwr
+                             ; alle Tasten l�schen
+                             FETCH idx_ptr, s_midi_chan_masked
+                             FETCH s1, s_midich                      ; eingestellter Kanal
+                             SUB idx_ptr, s1                         ; Manual in idx_ptr
+                             ADD idx_ptr, c_strobe_mask              ; 0 bis 2 plus Offset
+                             OUTPUT s0, RAM_WRDATA                   ; zu schreibende Dynamik INPUT s0
+                             LOAD s0, c_page_midirx1
+                             OUTPUT s0, RAM_PAGE                     ; MPX-RAM Page
+                             LOAD s1, 00                             ; Schleifenz�hler
+                             ; keine set_ram-Routine, da page_select, scan_number etc. nicht gültig!
+   allnotesoff_manual_loop1:
+                             OUTPUT s1, RAM_ADDR                     ; Tastennummer INPUT s1
+                             LOAD s0, c_page_midirx1
+                             OUTPUT s0, RAM_PAGE                     ; MPX-RAM Page
+                             OUTPUT s0, (idx_ptr)                    ; Upper, Lower oder Pedal Strobe
+                             LOAD s0, c_page_midirx2
+                             OUTPUT s0, RAM_PAGE                     ; MPX-RAM Page
+                             OUTPUT s0, (idx_ptr)                    ; Upper, Lower oder Pedal Strobe
+                             LOAD s0, c_page_keystatus1
+                             OUTPUT s0, RAM_PAGE                     ; MPX-RAM Page
+                             OUTPUT s0, (idx_ptr)                    ; Upper, Lower oder Pedal Strobe
+                             LOAD s0, c_page_keystatus2
+                             OUTPUT s0, RAM_PAGE                     ; MPX-RAM Page
+                             OUTPUT s0, (idx_ptr)                    ; Upper, Lower oder Pedal Strobe
+                             ADD s1, 01
+                             COMPARE s1, 64'd
+                             JUMP NZ, allnotesoff_manual_loop1
+                             RETURN
+                             ;
+           midi_out_waitbuf: ; MIDI MAIN OUT
+                             INPUT s1, TX_STATUS                     ; half full?
+                             COMPARE s1, 00                          ; nur 0, wenn beide TX1 und TX2 weniger als halbvoll
+                             JUMP NZ, midi_out_waitbuf               ; auf Buffer-Leerung warten
+                             RETURN
+                             ;
+          midi_out2_waitbuf: ; SAM5504-Buffer aufnahmebereit? zweiter interner MIDI-Ausgang
+                             INPUT s1, TX_STATUS                     ; half full?
+                             AND s1, 02
+                             COMPARE s1, 02
+                             JUMP Z, midi_out2_waitbuf               ; auf Buffer-Leerung warten
+                             RETURN
+                             ;
+                             ; ##############################################################################
+                             ; ###################### M I D I   I N P U T  1 (DIN1) #########################
+                             ; ##############################################################################
+                             ;
+                             ; MIDI Daten wurden von Input 1 empfangen
+                             ; SysCmds ausfiltern, Datenbytes sammeln und Flag setzen wenn vollst�ndig
+                             ;
+             midi_1_receive:
+                             INPUT s0, MIDI_IN1
+                             COMPARE s0, F0                          ; RealTime ab $F0?
+                             JUMP C, midi_1_channel_message          ; wenn kleiner als F0, mit Channel Messages weiter
+                             COMPARE s0, F8                          ; RealTime ab $F8?
+                             RETURN NC                               ; Realtime ab #F8 ohne Daten, verwerfen
+                             COMPARE s0, F0                          ; Start of SysEX, Flag setzen
+                             JUMP Z, midi_1_start_sysex_to_avr
+                             COMPARE s0, F7                          ; End of SysEX, Flag l�schen
+                             JUMP Z, midi_1_stop_sysex_to_avr
+                             ; ab hier nur noch Werte zwischen F1 und F6 �brig:
+                             ; F1 Timecode Quarter Frame, F2 Song Position Pointer, F3 Select Song
+                             LOAD s1, FF
+                             STORE s1, s_midi_1_ignoreflag           ; Flag setzen: folgende Daten ignorieren
+                             RETURN
+                             ;
+     midi_1_channel_message:
+                             TEST s0, 80
+                             JUMP Z, midi_1_is_databyte
+                             ; ist ab hier eine Channel Message
+                             STORE s0, s_midi_1_cmd
+                             LOAD s1, 00                             ; ist ein neuer (Running) Status
+                             STORE s1, s_midi_1_counter
+                             STORE s1, s_midi_1_ignoreflag           ; Flag l�schen: bald folgende Daten wieder relevant
+                             COMPARE midi_1_SysExFlag, 00
+                             JUMP NZ, midi_1_stop_sysex_to_avr       ; Sysex durch Channel-Command beendet
+                             RETURN
+                             ;
+         midi_1_is_databyte:
+                             COMPARE midi_1_SysExFlag, 00            ; L�uft SysEx-übertragung?
+                             JUMP NZ, midi_1_sysex_to_avr_s0         ; dann Daten zum AVR senden
+                             ;
+                             FETCH s1, s_midi_1_ignoreflag           ; Daten von Sytem Common F1, F2, F3?
+                             COMPARE s1, 00
+                             RETURN NZ                               ; Datenbytes ignorieren wenn ja
+                             ;
+                             FETCH s1, s_midi_1_counter
+                             ADD s1, 01
+                             STORE s1, s_midi_1_counter
+                             COMPARE s1, 02
+                             JUMP Z, midi_1_is_second_databyte
+                             ;
+                             ; erstes Datenbyte empfangen:
+                             ; Sonderfall Ein-Datenbyte-Befehle Program Change und Channel Pressure behandeln
+                             ; Datensatz ist mit einem Datenbyte vollst�ndig!
+                             FETCH s1, s_midi_1_cmd
+                             AND s1, F0                              ; Kanal ausmaskieren
+                             COMPARE s1, C0                          ; program change
+                             JUMP Z, midi_1_is_singledatabyte
+                             COMPARE s1, D0                          ; channel pressure
+                             JUMP Z, midi_1_is_singledatabyte
+   midi_1_is_first_databyte:
+                             STORE s0, s_midi_1_data1
+                             RETURN
+                             ; hier landen die Datenbytes von 1-Datenbyte-Befehlen:
+   midi_1_is_singledatabyte:
+                             STORE s0, s_midi_1_data1
+  midi_1_is_second_databyte:
+                             STORE s0, s_midi_1_data2
+                             FETCH s1, s_midi_1_counter
+                             STORE s1, s_midi_1_len                  ; letzte Anzahl empfangener Datenbytes
+                             LOAD s1, 00                             ; Datensatz vollst�ndig
+                             STORE s1, s_midi_1_counter              ; neue Anzahl empfangener Datenbytes
+                             LOAD midi_1_rxflag, FF                  ; jetzt vollst�ndig, Flag setzen
+                             RETURN
+                             ;
+  midi_1_start_sysex_to_avr:
+                             ; SysEx-Start $F0 wurde empfangen, ist in s0
+                             LOAD midi_1_SysExFlag, 01
+                             JUMP midi_1_sysex_to_avr_s0
+                             ;
+   midi_1_stop_sysex_to_avr:
+                             LOAD midi_1_SysExFlag, 00
+                             LOAD s0, F7
+     midi_1_sysex_to_avr_s0:
+                             ; 3 Bytes werden parallel übertragen, deshalb Umsetzung auf Controller für AVR-SPI
+                             LOAD s1, B0
+                             OUTPUT s1, MIDI_CMD
+                             LOAD s1, 78                             ; eigener Controller $7B = 123, eigentlich AllNotesOff
+                             OUTPUT s1, MIDI_DB1
+                             OUTPUT s0, MIDI_DB2                     ; SysEx-Daten einschl. F0 und F7, hier 8 Bit zul�ssig!
+                             JUMP midi_strobe_avr                    ; und RETURN
+                             ;
+                             ; ##############################################################################
+                             ; ################# M I D I   I N P U T  2 (DIN2/SAM/USB) ######################
+                             ; ##############################################################################
+                             ;
+                             ; MIDI Daten wurden von Input 2 empfangen
+                             ; SysCmds ausfiltern, Datenbytes sammeln und Flag setzen wenn vollst�ndig
+                             ;
+             midi_2_receive:
+                             INPUT s0, MIDI_IN2
+                             COMPARE s0, F0                          ; RealTime ab $F0?
+                             JUMP C, midi_2_channel_message          ; wenn kleiner als F0, mit Channel Messages weiter
+                             COMPARE s0, F8                          ; RealTime ab $F8?
+                             RETURN NC                               ; Realtime ab #F8 ohne Daten, verwerfen
+                             COMPARE s0, F0                          ; Start of SysEX, Flag setzen
+                             JUMP Z, midi_2_start_sysex_to_avr
+                             COMPARE s0, F7                          ; End of SysEX, Flag l�schen
+                             JUMP Z, midi_2_stop_sysex_to_avr
+                             ; ab hier nur noch Werte zwischen F1 und F6 �brig:
+                             ; F1 Timecode Quarter Frame, F2 Song Position Pointer, F3 Select Song
+                             LOAD s1, FF
+                             STORE s1, s_midi_2_ignoreflag           ; Flag setzen: folgende Daten ignorieren
+                             RETURN
+                             ;
+     midi_2_channel_message:
+                             TEST s0, 80
+                             JUMP Z, midi_2_is_databyte
+                             ; ist ab hier eine Channel Message
+                             STORE s0, s_midi_2_cmd
+                             LOAD s1, 00                             ; ist ein neuer (Running) Status
+                             STORE s1, s_midi_2_counter
+                             STORE s1, s_midi_2_ignoreflag           ; Flag l�schen: bald folgende Daten wieder relevant
+                             COMPARE midi_2_SysExFlag, 00
+                             JUMP NZ, midi_2_stop_sysex_to_avr       ; Sysex durch Channel-Command beendet
+                             RETURN
+                             ;
+         midi_2_is_databyte:
+                             COMPARE midi_2_SysExFlag, 00            ; L�uft SysEx-übertragung?
+                             JUMP NZ, midi_2_sysex_to_avr_s0         ; dann Daten zum AVR senden
+                             ;
+                             FETCH s1, s_midi_2_ignoreflag           ; Daten von Sytem Common F1, F2, F3?
+                             COMPARE s1, 00
+                             RETURN NZ                               ; Datenbytes ignorieren wenn ja
+                             ;
+                             FETCH s1, s_midi_2_counter
+                             ADD s1, 01
+                             STORE s1, s_midi_2_counter
+                             COMPARE s1, 02
+                             JUMP Z, midi_2_is_second_databyte
+                             ;
+                             ; erstes Datenbyte empfangen:
+                             ; Sonderfall Ein-Datenbyte-Befehle Program Change und Channel Pressure behandeln
+                             ; Datensatz ist mit einem Datenbyte vollst�ndig!
+                             FETCH s1, s_midi_2_cmd
+                             AND s1, F0                              ; Kanal ausmaskieren
+                             COMPARE s1, C0                          ; program change
+                             JUMP Z, midi_2_is_singledatabyte
+                             COMPARE s1, D0                          ; channel pressure
+                             JUMP Z, midi_2_is_singledatabyte
+   midi_2_is_first_databyte:
+                             STORE s0, s_midi_2_data1
+                             RETURN
+                             ; hier landen die Datenbytes von 1-Datenbyte-Befehlen:
+   midi_2_is_singledatabyte:
+                             STORE s0, s_midi_2_data1
+  midi_2_is_second_databyte:
+                             STORE s0, s_midi_2_data2
+                             FETCH s1, s_midi_2_counter
+                             STORE s1, s_midi_2_len                  ; letzte Anzahl empfangener Datenbytes
+                             LOAD s1, 00                             ; Datensatz vollst�ndig
+                             STORE s1, s_midi_2_counter              ; neue Anzahl empfangener Datenbytes
+                             LOAD midi_2_rxflag, FF                  ; jetzt vollst�ndig, Flag setzen
+                             RETURN
+                             ;
+  midi_2_start_sysex_to_avr:
+                             LOAD midi_2_SysExFlag, FF
+                             JUMP midi_2_sysex_to_avr_s0
+                             ;
+                             ; SysEx-Datenübertragung immer komplett abwarten
+   midi_2_stop_sysex_to_avr:
+                             LOAD midi_2_SysExFlag, 00
+                             LOAD s0, F7
+     midi_2_sysex_to_avr_s0:
+                             ; SysEx-Start $F0 wurde empfangen, ist in s0
+                             ; 3 Bytes werden parallel übertragen, deshalb Umsetzung auf Controller für AVR-SPI
+                             LOAD s1, B0
+                             OUTPUT s1, MIDI_CMD
+                             LOAD s1, 78                             ; eigener Controller $7B = 123, eigentlich AllNotesOff
+                             OUTPUT s1, MIDI_DB1
+                             OUTPUT s0, MIDI_DB2                     ; SysEx-Daten einschl. F0 und F7, hier 8 Bit zul�ssig!
+                             JUMP midi_strobe_avr                    ; und RETURN
+                             ;
+                             ; ##############################################################################
+                             ; ###################### M I D I   I N P U T  3 (AVR) ##########################
+                             ; ##############################################################################
+                             ;
+                             ; SPI-MIDI Daten wurden von AVR empfangen
+                             ; vereinfachte SysEx-Behandlung
+             midi_3_receive:
+                             ;
+                             ; LOAD s1, FA ; ##### TEST #####
+                             ; OUTPUT s1, AUXPORT ; Trigger für LA
+                             ; OUTPUT s0, AUXPORT ; ##### TEST #####
+                             INPUT s0, MIDI_AVR
+                             COMPARE s0, F0                          ; SysEx-Start?
+                             JUMP Z, midi_3_startSysEx
+                             COMPARE s0, F7                          ; SysEx-Ende?
+                             JUMP Z, midi_3_stopSysEx
+                             FETCH s1, s_midi_3_SysExFlag
+                             COMPARE s1, 00
+                             JUMP NZ, midi_tx_both                   ; s0 Senden, übertragung l�uft noch
+                             ;
+                             TEST s0, 80
+                             JUMP Z, midi_3_is_databyte
+                             LOAD s1, 00                             ; ist ein neuer (Running) Status
+                             STORE s1, s_midi_3_counter
+                             STORE s1, s_midi_3_SysExFlag
+                             STORE s0, s_midi_3_cmd
+                             RETURN
+         midi_3_is_databyte:
+                             FETCH s1, s_midi_3_counter
+                             ADD s1, 01
+                             STORE s1, s_midi_3_counter
+                             COMPARE s1, 02
+                             JUMP Z, midi_3_is_second_databyte
+                             ; erstes Datenbyte empfangen:
+                             ; Sonderfall Ein-Datenbyte-Befehle Program Change und Channel Pressure behandeln
+                             ; Datensatz ist mit einem Datenbyte vollst�ndig!
+                             FETCH s1, s_midi_3_cmd
+                             AND s1, F0                              ; Kanal ausmaskieren
+                             COMPARE s1, C0                          ; program change
+                             JUMP Z, midi_3_is_singledatabyte
+                             COMPARE s1, D0                          ; channel pressure
+                             JUMP Z, midi_3_is_singledatabyte
+   midi_3_is_first_databyte:
+                             STORE s0, s_midi_3_data1
+                             RETURN
+                             ; hier landen die Datenbytes von 1-Datenbyte-Befehlen:
+   midi_3_is_singledatabyte:
+                             STORE s0, s_midi_3_data1
+  midi_3_is_second_databyte:
+                             STORE s0, s_midi_3_data2
+                             FETCH s1, s_midi_3_counter
+                             STORE s1, s_midi_3_len                  ; Anzahl empfangener Datenbytes
+                             LOAD s1, 00                             ; Datensatz vollst�ndig
+                             STORE s1, s_midi_3_counter              ; letzte Anzahl empfangener Datenbytes
+                             LOAD midi_3_rxflag, FF                  ; jetzt vollst�ndig, Flag setzen
+                             RETURN
+                             ; SysEx-Daten vom AVR unbehandelt senden, aber Flag setzen
+          midi_3_startSysEx:
+                             CALL midi_tx_both                       ; verwendet s1
+                             LOAD s1, FF
+                             STORE s1, s_midi_3_SysExFlag
+                             RETURN
+           midi_3_stopSysEx:
+                             CALL midi_tx_both                       ; verwendet s1
+                             LOAD s1, 00
+                             STORE s1, s_midi_3_SysExFlag
+                             RETURN
+                             ;
+            midi_strobe_avr:
+                             LOAD s0, 01                             ; pos. Flanke an MIDI-FIFO
+                             OUTPUT s0, MIDI_STR
+                             LOAD s0, 00
+                             OUTPUT s0, MIDI_STR
+                             RETURN
+                             ;
+                             ; ##############################################################################
+                             ; ##############################################################################
+                             ; ###                           Initialisierungen                            ###
+                             ; ##############################################################################
+                             ; ##############################################################################
+                             ;
+                  scan_init:
+                             LOAD s0, 00
+                             OUTPUT s0, STATUS
+                             OUTPUT s0, MIDI_OUT_SEL
+                             LOAD midi_1_rxflag, 00
+                             LOAD midi_2_rxflag, 00
+                             LOAD midi_1_SysExFlag, 00
+                             LOAD midi_2_SysExFlag, 00
+                             LOAD midi_3_rxflag, 00
+                             LOAD page_select, 00
+                             LOAD manual_select, 00
+                             LOAD s8_msb, 00
+                             LOAD s7_lsb_spoint, 00
+                             LOAD event_key, 00
+                             LOAD scan_number, 00
+                             LOAD s3_key_status, 00
+                             LOAD idx_ptr, 00
+                             ; LOAD s0, F8                             ; NEU ab #31
+                             ; STORE s0, s_average_dyn                 ; Mittelwert eigener Anschlag
+                             LOAD s0, 00
+          zero_scratch_loop:
+                             STORE s0, (idx_ptr)
+                             ADD idx_ptr, 01
+                             COMPARE idx_ptr, 40
+                             JUMP NZ, zero_scratch_loop
+                             ;
+                             LOAD s0, 40
+                             STORE s0, s_last_key_velocity
+                             LOAD idx_ptr, 00
+                             CALL scan_wait_init
+                             CALL allnotesoff
+                             LOAD s0, 00
+                             OUTPUT s0, RAM_PAGE
+                             CALL split_sendallnotesoff
+                             ; INIT Message mit ScanCore Info
+                             LOAD s0, c_corevers
+                             OUTPUT s0, MIDI_DB2
+                             LOAD s0, c_corerevi
+                             OUTPUT s0, MIDI_DB1
+                             LOAD s0, AA
+                             OUTPUT s0, MIDI_CMD
+                             CALL midi_strobe_avr
+                             RETURN
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+               midi_testout:
+                             ; für Debug-Zwecke, sendet MIDI-Programchange mit Wert in s0
+                             LOAD s1, C0
+                             OUTPUT s1, MIDI_TX_1                    ; TX Midi auf DIN-Buchse
+                             OUTPUT s1, MIDI_TX_2                    ; TX Midi an SAM
+                             OUTPUT s0, MIDI_TX_1                    ; TX Midi auf DIN-Buchse
+                             OUTPUT s0, MIDI_TX_2                    ; TX Midi an SAM
+                             RETURN
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+                scan_config:
+                             LOAD s0, 00
+                             FETCH s1, s_keycount_upper              ; Anzahl gedrückter Tasten Upper
+                             COMPARE s1, 00
+                             CALL NZ, load_s0_with_max
+                             OUTPUT s0, KEYS_ON_UPR
+                             ;
+                             LOAD s0, 00
+                             FETCH s1, s_keycount_lower              ; Anzahl gedrückter Tasten Lower
+                             COMPARE s1, 00
+                             CALL NZ, load_s0_with_max
+                             OUTPUT s0, KEYS_ON_LWR
+                             ;
+                             INPUT s0, SPI_KEYTRANSPOSE
+                             FETCH s1, s_keytranspose
+                             COMPARE s0, s1
+                             STORE s0, s_keytranspose
+                             CALL NZ, split_sendallnotesoff          ; Key-Transpose ge�ndert
+                             INPUT s0, SPI_GENTRANSPOSE
+                             FETCH s1, s_gentranspose
+                             COMPARE s0, s1
+                             STORE s0, s_gentranspose
+                             CALL NZ, split_sendallnotesoff          ; Generator-Transpose ge�ndert
+                             INPUT s1, SPI_CLICKLEN
+                             AND s1, 0F                              ; max. 15 ms
+                             LOAD s0, FF
+                             SUB s0, s1
+                             STORE s0, s_clicklen                    ; Startwert 1ms-Timer, max. 255
+                             INPUT s0, SPI_CLICKLEN
+                             AND s0, F0
+                             SR0 s0
+                             SR0 s0                                  ; Wert immer noch vervierfacht
+                             ; z.B. $13(5A) = Teilfaktor 4954 für 10 kHz Samples oder 5 kHz Noise-Frequenz
+                             OUTPUT s0, NOISE_FREQ
+                             ; MIDI-Kanal ge�ndert?
+                             FETCH s1, s_midich
+                             INPUT s0, SPI_MIDICH
+                             COMPARE s0, s1
+                             STORE s0, s_midich
+                             CALL NZ, allnotesoff                    ; wenn MIDI-Kanal ge�ndert
+                             ; OUTPUT s0, AUXPORT ; Trigger für LA
+                             INPUT s0, SPI_MIDIOPT
+                             OUTPUT s0, MIDI_OUT_SEL
+                             ;
+                             ; Split überpr�fen. In SPI_XXX befindet sich ggf. neue Split-ON/OFF-Einstellung vom Panel
+                             FETCH s0, s_splitpoint
+                             INPUT s1, SPI_SPLITPOINT
+                             STORE s1, s_splitpoint
+                             COMPARE s0, s1
+                             CALL NZ, split_changed                  ; wenn ge�ndert
+                             ;
+                             FETCH s0, s_splitmode
+                             INPUT s1, SPI_SPLITMODE
+                             STORE s1, s_splitmode
+                             COMPARE s0, s1
+                             CALL NZ, split_changed                  ; wenn ge�ndert
+                             ;
+                             FETCH s0, s_split_on                    ; alter Split-On-Zustand
+                             INPUT s1, SPI_SPLITON                   ; neu von Bedienelement
+                             STORE s1, s_split_on
+                             COMPARE s0, s1
+                             RETURN Z                                ; nicht ge�ndert
+                             TEST s1, 02                             ; Split-Request-Bit gesetzt?
+                             JUMP NZ, set_splitpoint                 ; anhand eigener Tastendr�cke setzen
+                             ; sonst nur weiter mit split_changed
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+              split_changed:
+                             CALL split_sendallnotesoff              ; wenn ge�ndert
+             split_mode_new:
+                             FETCH s0, s_split_on
+                             AND s0, 03
+                             ; COMPARE s0, 00
+                             JUMP Z, split_exit
+                             RETURN
+                             ;
+                             ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+                             ;
+             scan_wait_init:
+                             LOAD s0, c_scankey_delay                ; Scan-Timer neu laden
+                             OUTPUT s0, SCANTIMER_VAL
+                             RETURN
+                             ; Active Sensing senden falls Timer abgelaufen
+             active_sensing:
+                             FETCH s0, s_midi_activesensing          ; nach 256 ms Active Sensing senden
+                             ADD s0, 01
+                             STORE s0, s_midi_activesensing
+                             COMPARE s0, 00
+                             RETURN NZ
+                             ; TEST: Active Sensing abgeschaltet
+                             ; RETURN
+                             CALL midi_out_waitbuf
+                             LOAD s0, FE
+                             OUTPUT s0, MIDI_TX_1
+                             OUTPUT s0, MIDI_TX_2
+                             RETURN
+                             ;
+                             ; ##############################################################################
+                             ; Splitmode setzen:
+                             ; 0 = PedalToLower,
+                             ; 1 = LowerToUpper
+                             ; 2 = PedalToUpper
+                             ; 3 = LowerToUpper + 1 Oktave
+                             ; 4 = LowerToUpper + 2 Oktaven
+                             ; 5 = Add Pedal to Lower
+                             ; ##############################################################################
+                             ;
+             set_splitpoint:
+                             FETCH s0, s_split_on
+                             AND s0, 03
+                             ; COMPARE s0, 00                            ; nun ausgeschaltet?
+                             JUMP Z, split_exit                      ; dann All Notes Off und Ende
+                             ; Split-Funktion wurde seit letztem Durchlauf von OFF auf ON ge�ndert.
+                             ; Feststellen, ob Keyboard-Tasten gedrückt wurden, dann diese setzen und als
+                             ; Splitpoint an AVR senden.
+                             FETCH s0, s_keycount_upper
+                             FETCH s1, s_keycount_lower
+                             ADD s0, s1
+                             COMPARE s0, 00
+                             JUMP Z, split_exit                      ; keine Tasten gedrückt, alter Splitmode
+                             FETCH s7_lsb_spoint, s_lastkey_on
+                             STORE s7_lsb_spoint, s_splitpoint
+                             ;
+                             COMPARE s1, 00
+                             JUMP Z, set_splitpoint_upper            ; keine Tasten auf Lower, also Upper
+                             SUB s1, 01
+                             COMPARE s1, 00
+                             JUMP Z, set_splitpoint_store            ; wenn nur eine Taste gedrückt, SplitMode 0 speichern
+                             LOAD s1, 05                             ; sonst 5 = Add Pedal to Lower
+                             JUMP set_splitpoint_store
+                             ;
+       set_splitpoint_upper:
+                             ; Anzahl der Tasten Obermanual ist zuf�llig auch Splitmode 0..4
+                             FETCH s1, s_keycount_upper
+       set_splitpoint_store:
+                             STORE s1, s_splitmode
+                             ; gew�nschten Splitmode an AVR senden, über internal MIDI an Controller $70 und $71
+                             LOAD s0, B0
+                             OUTPUT s0, MIDI_CMD
+                             LOAD s0, 76
+                             OUTPUT s0, MIDI_DB1
+                             OUTPUT s1, MIDI_DB2
+                             CALL midi_strobe_avr
+                             ; MIDI_CMD bleibt!
+                             LOAD s0, 77
+                             OUTPUT s0, MIDI_DB1
+                             OUTPUT s7_lsb_spoint, MIDI_DB2
+                             CALL midi_strobe_avr
+                             ;
+                 split_exit:
+      split_sendallnotesoff:
+                             CALL allnotesoff
+                             FETCH s0, s_midich
+                             ADD s0, B0
+                             CALL midi_tx_both
+                             CALL split_sendoff_data
+                             FETCH s0, s_midich
+                             ADD s0, B1
+                             CALL midi_tx_both
+                             CALL split_sendoff_data
+                             FETCH s0, s_midich
+                             ADD s0, B2
+                             CALL midi_tx_both
+         split_sendoff_data:
+                             LOAD s0, 7B                             ; Controller 123
+                             OUTPUT s0, MIDI_TX_1
+                             OUTPUT s0, MIDI_TX_2
+                             LOAD s0, 7F                             ; 127
+                             OUTPUT s0, MIDI_TX_1
+                             OUTPUT s0, MIDI_TX_2
+                             RETURN
