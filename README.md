@@ -1,4 +1,7 @@
 # HX3 Scan Drivers
+
+![HX3.7 Pic](https://github.com/keyboardpartner/HX3-Scan-Drivers/blob/main/docs/mainboard37_kl.JPG)
+
 ### Scan drivers for PicoBlaze Core in HX3 Sound Engine (FPGA)
 
 These are different scan driver sources for HX3.6 and HX3.7 mainboards, to be compiled with PicoBlaze Assembler KCPSM6 from Ken Chapman.
@@ -6,6 +9,8 @@ These are different scan driver sources for HX3.6 and HX3.7 mainboards, to be co
 Repository contains KCPSM6 and HEX converter for creation of *scan.dat* files; use batch files to execute.
 
 Schematics to be found on http://updates.keyboardpartner.de/Files/index.php?dir=Schematics
+
+TODO: Update XB2/XB5 scan driver to new framework.
 
 Version Info:
 * 27.01.2025 #51 Neues universelles Framework mit *includes*, gemeinsam für alle HX3 Scan Driver
@@ -20,3 +25,5 @@ Version Info:
 * 30.07.2021 #37 Sendet page_init bei Split-Änderungen, SplitMode 5 (AddPedalToLower)
 * 18.05.2021 #36 Andere Noise-Berechnung
 * 12.01.2021 #33 Bug in ResetDynTimers behoben
+
+C. Meyer 11/2010..02/2026
