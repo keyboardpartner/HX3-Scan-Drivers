@@ -1,4 +1,4 @@
-# HX3 Scan Drivers
+# HX3.6/3.7 Scan Drivers
 
 ![HX3.7 Pic](https://github.com/keyboardpartner/HX3-Scan-Drivers/blob/main/docs/mainboard37_kl.JPG)
 
