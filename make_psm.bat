@@ -4,6 +4,7 @@ if exist %~n1.psm (
   kcpsm6 %1 %~n1.hex -c2047
   type KCPSM6_session_log.txt
   hex2dat_kcpsm6 %~n1.hex 2
+  del .\bin\scan_%~n1.dat
   copy %~n1.dat .\bin\scan_%~n1.dat
   copy %~n1.fmt %~n1.psm
   copy midi_io.fmt midi_io.psm
