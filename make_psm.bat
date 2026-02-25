@@ -1,7 +1,7 @@
 echo off
 echo Assemble and convert PSM file given as argument for use with VScode Task Runner
 if exist %~n1.psm (
-  kcpsm6 %1 %~n1.hex -c2047
+  kcpsm6 "%1"
   type KCPSM6_session_log.txt
   hex2dat_kcpsm6 %~n1.hex 2
   del .\bin\scan_%~n1.dat

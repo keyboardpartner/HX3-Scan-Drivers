@@ -64,6 +64,7 @@
                       CONSTANT c_page_earlystep, 05        ; Eigene Tastatur Early-Zustand für Tasten 0..60
                       CONSTANT c_page_latestep, 06         ; Eigene Tastatur 2 Stufen für Tasten 0..60, aus Dynamik errechnet
                       CONSTANT c_page_sostenuto, 07        ; Sostenuto-Flags 0..60
+                      CONSTANT c_page_keycontacts, 08      ; vorheriger Tastenzustand 0..60
                       ;
                       ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
                       ; Portadressen bidirektional
@@ -125,8 +126,11 @@
                       CONSTANT RAM_ADDR, 41                ; für alle Zugriffe gültig
                       CONSTANT RAM_WRDATA, 42              ; zu schreibende Daten
                       ;
-                      CONSTANT MIDI_TX_DIN, 80             ; MIDI UART-Tx-FIFO an DIN MAIN OUT
-                      CONSTANT MIDI_TX_SAM, 81             ; MIDI UART-Tx-FIFO an SAM5504 DSP
+                      CONSTANT MIDI_TX_DIN, 80             ; MIDI UART-Tx-FIFO an DIN MAIN OUT, MIDI_STRB_128
+                      CONSTANT MIDI_TX_SAM, 81             ; MIDI UART-Tx-FIFO an SAM5504 DSP, MIDI_STRB_129
+                      ;
+                      CONSTANT DYN_TABLE, 82               ; LC Dyntable Daten Lesen, 0..127
+                      CONSTANT DYN_TABLE_ADDR, 82          ; LC Dyntable Adresse Schreiben, 0..255, Timerwert 0 = schnellste Taste, 255 = langsamste Taste
                       ;
                       ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
                       ; Input Ports
@@ -154,6 +158,7 @@
                       CONSTANT MIDI_IN_SAM, 37             ; MIDI IN SAM auf eigenem FIFO (neu, separat statt mit MIDI IN2 verANDet)
                       CONSTANT MIDI_SAM_STATUS, 33         ; "0000" & midi_3_full & midi_3_half & midi_3_datapresent & '0';
                       CONSTANT RND_NUMBER, 3F              ; Zufallswert 8 Bit
+                      ;
                       ; Werte vom AVR-SPI
                       CONSTANT SPI_MIDICH, 24              ; Adresse $04 von außen (AVR)
                       CONSTANT SPI_MIDIOPT, 25
@@ -196,6 +201,7 @@
                       CONSTANT s_keystatus_lower, 11
                       CONSTANT s_keystatus_pedal, 12
                       ;
+                      CONSTANT s_tdrive , 20'd               ; für Tastenabfrage, aktueller T-Drive-Wert, 0..7 für Fatar und Pulse
                       ;
                       CONSTANT s_keycount_upper, 32'd
                       CONSTANT s_keycount_lower, 33'd
@@ -221,7 +227,7 @@
                       CONSTANT s_scanloop_counter, 53'd
                       CONSTANT s_lastkey_on, 54'd          ; letzte gedrückte Taste für Split
                       CONSTANT s_clicklen, 55'd            ; Timer-Startwert
-                      CONSTANT s_last_key_velocity, 56'd
+                      CONSTANT s_last_keytime, 56'd
                       ;
                       ;
                       CONSTANT s_vcont_upper, 61'd         ; gleichzeitig von Event gelesene Kontakt-Zustände

@@ -17,7 +17,8 @@
                       ; https://www.amd.com/en/products/adaptive-socs-and-fpgas/intellectual-property/picoblaze.html
                       ; https://www1.hs-bremerhaven.de/kmueller/VHDL/PB_Instr_Ref.pdf
                       ;
-                      ; 27.01.2025 #51 Neues universelles Framework, hier für Fatar 61-Tastatur mit 8x8 Matrix und FatarScan2-Board (alt)
+                      ; 26.02.2026 #52 für FPGA ab #23022024, mit ladbarer Dynamik-Tabelle, siehe "states_dyntable.psm"
+                      ; 27.01.2026 #51 Neues universelles Framework, hier für Fatar 61-Tastatur mit 8x8 Matrix und FatarScan2-Board (alt)
                       ; 10.12.2025 #49 Support für neues FPGA mit separatem SAM5504-MIDI-FIFO, MIDI GETBYTE gestrafft
                       ; 11.07.2025 #47 Neue Organisation der Tastenabfrage mit vertauschter Spalte/Reihe (4017/4024-Zähler), deutlich schneller
                       ; 23.07.2024 #46 Bugfix: MIDI SEND ENABLES waren nicht implementiert, siehe "local_states_out"
@@ -53,11 +54,13 @@
                       ; Pin 1 = Bit 0 Cancel MIDI Kanal invert., 01 = Cancel Lower, 00 = Cancel Pedal
                       ;
                       ; $60=SR4014, $61=Fatar, $62=Opto, $63=MIDI, $64=OrganScan61, $65=XB2-5, $66=Fatar61 (neu), $67=Fatar73 (neu, mit Presets)
+                      CONSTANT c_corerevi, 52              ; Revisionsnummer
                       CONSTANT c_corevers, 61
                       CONSTANT c_corevers_midionly, 63     ; zum Vergleichen im MIDI-Scan-Treiber
-                      CONSTANT c_corerevi, 51              ; Revisionsnummer
                       CONSTANT c_dyn_threshold, 40         ; MIDI-Dynamikschwelle für full click
                       CONSTANT c_midi_mindyn, 10           ; MIDI-Minimaldynamik langsame Taste
+                      CONSTANT c_time_offset, 06           ; Offset, wird von gemessener Velocity-Zeit abgezogen
+                      CONSTANT c_time_threshold, A0        ; Velocity-Zeitschwelle für full click
                       ;
                       ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
                       ;
@@ -89,7 +92,8 @@
                       INCLUDE "registers.psm"
                       INCLUDE "init.psm"
                       INCLUDE "switches.psm"               ; Fußschalter einlesen und verarbeiten
-                      INCLUDE "states.psm"                 ; Zustandsautomaten für Tastenverarbeitung
+                      ; INCLUDE "states.psm"               ; Zustandsautomaten für Tastenverarbeitung
+                      INCLUDE "states_dyntable.psm"        ; Zustandsautomaten für Tastenverarbeitung, mit BRAM-Dynamiktabelle
                       INCLUDE "events_mpx.psm"             ; Event-Loop für MPX-RAM Verarbeitung
                       INCLUDE "timers.psm"                 ; Timer-Routinen für Zustandsautomaten
                       INCLUDE "midi_io.psm"                ; MIDI-Subroutinen für MIDI-Empfang
@@ -233,7 +237,8 @@
                       LOAD s0, s0                          ; NOPs für 160ns Setup (typ. 90ns)
                       OUTPUT s0, AUXPIO1                   ; SR-Clk-Impuls für SR-Load
                       LOAD s5_scan_key, 00                 ; s5_scan_key auf 0
-                      LOAD s0, 00                          ; NOPs für 160ns Impuls (typ. 90ns)
+                      LOAD s0, s0                          ; NOPs für 160ns Impuls (typ. 90ns)
+                      LOAD s0, 00
                       OUTPUT s0, AUXPIO1
                       OUTPUT s0, AUXPIO2
                       RETURN 
@@ -265,7 +270,8 @@ local_scanloop_pedal:
                       LOAD s0, 01
                       OUTPUT s0, AUXPIO1                   ; SR-Clk-Impuls für SR-Load
                       ADD s5_scan_key, 01                  ; nächste Pedal-Taste
-                      LOAD s0, 00                          ; NOPs für 160ns Impuls (typ. 90ns)
+                      LOAD s0, s0                          ; NOPs für 160ns Impuls (typ. 90ns)
+                      LOAD s0, 00
                       OUTPUT s0, AUXPIO1
                       ;
                       COMPARE s5_scan_key, c_maxbasskeys
@@ -329,7 +335,7 @@ local_was_idle_pedal: ; war vorher OFF
                       ;
                       ; ###############################################################################
                       ;
-                      ; NEUE Manual-Loops, Zeitbedarf ca. 220 µs bei 600 ns Einschwingeit pro Gruppe
+                      ; NEUE Manual-Loops, Zeitbedarf ca. 135 µs bei 600 ns Einschwingeit pro Gruppe
                       ; ------------------------------------------------------------------------------
                       ; Neue, schnellere Scan-Abfrage wg. Trägheit der Dioden-Matrix
                       ; Vorher (#46): Wartezeit nach jeder einzelnen Taste nötig wg. Settle Time der Diodenmatrix
@@ -391,7 +397,18 @@ local_was_idle_pedal: ; war vorher OFF
                       ; Tastenzustand jetzt in s3_keystatus und sB_keystatus_lwr,
                       ; kann jetzt ausgewertet werden
                       ;
+                      ; ist überhaupt etwas zu tun?
+                      LOAD s1, s3_keystatus                ; alle Kontakte in einem Byte zusammenfassen, um nur einmal vergleichen zu müssen
+                      SL0 s1
+                      SL0 s1
+                      OR s1, sB_keystatus_lwr
+                      CALL local_rd_keycont_s0             ; vorherigen Kontaktstatus der Taste in s0
+                      OR s0, s1
+                      COMPARE s0, 00                       ; keine Kontakte, vorher auch keine Kontakte?
+                      JUMP Z, local_keys_skip_1            ; keine Kontaktänderung, nächste Taste
+                      CALL local_wr_keycont_s1             ; Kontaktänderung, neuen Status in RAM schreiben
                       CALL local_handle_keybds
+   local_keys_skip_1: 
                       ;
                       ; Inc 4024 MPX Sense Counter, nach 8 Pulsen Inc T Drive 4017
                       ; erhöht sA_matrix_key um 1 und s5_scan_key um 8 oder 1
@@ -423,6 +440,23 @@ local_was_idle_pedal: ; war vorher OFF
                       COMPARE sA_matrix_key, c_maxkeys_8x8
                       JUMP NZ, local_scanloop
                       RETURN                               ; kein Pedal abfragen!
+                      ;
+ local_wr_keycont_s1: ; Taste in s5_scan_key, zu schreibende Daten in s3_keystatus, sB_keystatus_lwr
+                      LOAD s6_idx_ptr, c_page_keycontacts
+                      OUTPUT s6_idx_ptr, RAM_PAGE          ; MPX-RAM Page
+                      OUTPUT s5_scan_key, RAM_ADDR         ; Tastennummer
+                      OUTPUT s1, RAM_WRDATA                ; zu schreibende Daten
+                      LOAD s6_idx_ptr, c_strobe_mask
+                      OUTPUT s0, (s6_idx_ptr)              ; Upper, Lower oder Pedal Strobe
+                      RETURN 
+                      ;
+ local_rd_keycont_s0: ; Taste in s5_scan_key, gelesene Daten später in s0
+                      LOAD s6_idx_ptr, c_page_keycontacts
+                      OUTPUT s6_idx_ptr, RAM_PAGE          ; MPX-RAM Page
+                      OUTPUT s5_scan_key, RAM_ADDR         ; Tastennummer
+                      LOAD s6_idx_ptr, c_read_mask
+                      INPUT s0, (s6_idx_ptr)               ; Upper, Lower oder Pedal Read
+                      RETURN                               ; Zustand in s0
                       ;
                       ; ###############################################################################
                       ;

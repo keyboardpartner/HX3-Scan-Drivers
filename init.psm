@@ -53,12 +53,12 @@
                         JUMP NZ, zero_scratch_loop
                         ;
                         LOAD s0, 40
-                        STORE s0, s_last_key_velocity
+                        STORE s0, s_last_keytime
                         LOAD s6_idx_ptr, 00
                         CALL scantimer_start
                         LOAD s0, 00
                         OUTPUT s0, RAM_PAGE
-                        JUMP send_alloff
+                        JUMP send_alloff ; MIDI senden
                         ;
     allnotesoff_manual:
                         LOAD s0, 00
@@ -71,8 +71,8 @@
                         FETCH s1, s_midich                    ; eingestellter Kanal
                         SUB s6_idx_ptr, s1                    ; Manual in s6_idx_ptr
                         ADD s6_idx_ptr, c_strobe_mask         ; 0 bis 2 plus Offset
-                        OUTPUT s0, RAM_WRDATA                 ; zu schreibende Dynamik INPUT s0
                         LOAD s1, 00                           ; Schleifenzähler
+                        OUTPUT s0, RAM_WRDATA                 ; zu schreibende Daten in s0
                         ; keine set_ram-Routine, da sA_page_select, s5_scan_key etc. nicht gültig!
      allnotesoff_loop1:
                         OUTPUT s1, RAM_ADDR                   ; Tastennummer in s1
@@ -85,10 +85,10 @@
                         LOAD s0, c_page_keystate
                         OUTPUT s0, RAM_PAGE                   ; MPX-RAM Page
                         OUTPUT s0, (s6_idx_ptr)               ; Upper, Lower oder Pedal Strobe
-                        LOAD s0, c_page_keystate
+                        LOAD s0, c_page_sostenuto
                         OUTPUT s0, RAM_PAGE                   ; MPX-RAM Page
                         OUTPUT s0, (s6_idx_ptr)               ; Upper, Lower oder Pedal Strobe
-                        LOAD s0, c_page_sostenuto
+                        LOAD s0, c_page_keycontacts
                         OUTPUT s0, RAM_PAGE                   ; MPX-RAM Page
                         OUTPUT s0, (s6_idx_ptr)               ; Upper, Lower oder Pedal Strobe
                         ADD s1, 01

@@ -1,13 +1,13 @@
                       ;
                       ; ##############################################################################
                       ;
-                      ;    #######    #    #######    #    ######      #          #####    #
-                      ;    #         # #      #      # #   #     #    ##         #     #  ##
-                      ;    #        #   #     #     #   #  #     #   # #         #       # #
-                      ;    #####   #     #    #    #     # ######      #   ##### ######    #
-                      ;    #       #######    #    ####### #   #       #         #     #   #
-                      ;    #       #     #    #    #     # #    #      #         #     #   #
-                      ;    #       #     #    #    #     # #     #   #####        #####  #####
+                      ;   ######  #     # #        #####  #######    #####    #
+                      ;   #     # #     # #       #     # #         #     #  ##
+                      ;   #     # #     # #       #       #         #       # #
+                      ;   ######  #     # #        #####  #####     ######    #
+                      ;   #       #     # #             # #         #     #   #
+                      ;   #       #     # #       #     # #         #     #   #
+                      ;   #        #####  #######  #####  #######    #####  #####
                       ;
                       ; ##############################################################################
                       ; ############ KCPSM6 PicoBlaze Keyboard Scanner by cm 10/2010 #################
@@ -53,14 +53,14 @@
                       ; Pin 2 = Bit 1 Cancel MIDI Kanal invert., 11 = Cancel Off, 10 = Cancel Upper,
                       ; Pin 1 = Bit 0 Cancel MIDI Kanal invert., 01 = Cancel Lower, 00 = Cancel Pedal
                       ;
-                      ; $60=SR4014, $61=Fatar, $62=Opto, $63=MIDI, $64=OrganScan61, $65=XB2-5, $66=Fatar61 (neu), $67=Fatar73 (neu, mit Presets)
+                      ; $60=SR4014, $61=Fatar, $62=Opto, $63=MIDI, $64=OrganScan61, $65=XB2-5, $66=Fatar61 (neu), $67=Fatar73 (neu, mit Presets), $68=Pulse 6105W
                       CONSTANT c_corerevi, 52              ; Revisionsnummer
-                      CONSTANT c_corevers, 66
+                      CONSTANT c_corevers, 68
                       CONSTANT c_corevers_midionly, 63     ; zum Vergleichen im MIDI-Scan-Treiber
                       CONSTANT c_dyn_threshold, 40         ; MIDI-Dynamikschwelle für full click
-                      CONSTANT c_midi_mindyn, 10           ; MIDI-Minimaldynamik langsame Taste
                       CONSTANT c_time_offset, 06           ; Offset, wird von gemessener Velocity-Zeit abgezogen
                       CONSTANT c_time_threshold, A0        ; Velocity-Zeitschwelle für full click
+                      CONSTANT c_midi_mindyn, 10           ; MIDI-Minimaldynamik langsame Taste
                       ;
                       ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
                       ;
@@ -269,7 +269,7 @@ local_scanloop_pedal:
                       OUTPUT s0, AUXPIO1                   ; SR-Clk-Impuls für SR-Load
                       ADD s5_scan_key, 01                  ; nächste Pedal-Taste
                       LOAD s0, s0                          ; NOPs für 160ns Impuls (typ. 90ns)
-                      LOAD s0, 00
+                      LOAD s0, 00                          
                       OUTPUT s0, AUXPIO1
                       ;
                       COMPARE s5_scan_key, c_maxbasskeys
@@ -333,7 +333,7 @@ local_was_idle_pedal: ; war vorher OFF
                       ;
                       ; ###############################################################################
                       ;
-                      ; NEUE Manual-Loops, Zeitbedarf ca. 125 µs bei 600 ns Einschwingeit pro Gruppe
+                      ; NEUE Manual-Loops, Zeitbedarf ca. 140 µs bei 600 ns Einschwingeit pro Gruppe
                       ; ------------------------------------------------------------------------------
                       ; Neue, schnellere Scan-Abfrage wg. Trägheit der Dioden-Matrix
                       ; Vorher (#46): Wartezeit nach jeder einzelnen Taste nötig wg. Settle Time der Diodenmatrix
@@ -357,11 +357,22 @@ local_was_idle_pedal: ; war vorher OFF
                       ; LOWER Q,   SCANPIN8 (D7)
                       ; ------------------------------------------------------------------------------
                       ;
-   pulse_srclk_fatar: ; hier für FATAR 1-61 (neu)
+   pulse_srclk_fatar: ; hier für FATAR 1-61 (neu) und Pulse 6105W
                       LOAD s0, 01
                       OUTPUT s0, SCANPIO4                  ; SR CLK auf 1
                       LOAD s0, 00
                       OUTPUT s0, SCANPIO4                  ; SR CLK auf 0
+                      RETURN 
+                      ; 5 Clk-Vorimpulse erzeugen
+      prepulse_srclk: ; hier für Pulse 6105W
+                      LOAD s1, 06
+ prepulse_srclk_loop: 
+                      LOAD s0, 01
+                      OUTPUT s0, SCANPIO4                  ; SR CLK auf 1
+                      LOAD s0, 00
+                      OUTPUT s0, SCANPIO4                  ; SR CLK auf 0
+                      SUB s1, 01
+                      JUMP NZ, prepulse_srclk_loop
                       RETURN 
                       ;
                       ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -370,8 +381,8 @@ local_was_idle_pedal: ; war vorher OFF
                       LOAD s0, 00                          ; s3_keystatus aller Tasten in s_keypressed_acc sammeln (OR'ed)
                       STORE s0, s_keypressed_acc
                       STORE s0, s_tdrive
-                      LOAD s5_scan_key, 00                 ; 61'd bei Pulse6105W
-                      LOAD sA_matrix_key, 00               ; s5_scan_key auf 61 und sA_matrix_key auf 0
+                      LOAD s5_scan_key, 61'd               ; s5_scan_key auf 61 und sA_matrix_key auf 0
+                      LOAD sA_matrix_key, 00
  local_load_sr_pulse: 
                       FETCH s0, s_tdrive
                       AND s0, 07                           ; nur 3 Bits für T-Drive
@@ -382,7 +393,7 @@ local_was_idle_pedal: ; war vorher OFF
                       CALL pulse_srclk_fatar               ; SR lesen
                       LOAD s1, 01
                       OUTPUT s1, SCANPIO5                  ; SR LOAD wieder auf 1 = SHIFT, falls vorher LOAD
-                      ; CALL prepulse_srclk                  ; nur bei Pulse6105W
+                      CALL prepulse_srclk                  ; nur bei Pulse6105W
                       JUMP local_keys_loop7                ; Lade-Impuls zählt als erster SR-Shift, deshalb direkt zu Loop7 springen
     local_keys_loop8: 
                       CALL pulse_srclk_fatar               ; SR weiterschalten
