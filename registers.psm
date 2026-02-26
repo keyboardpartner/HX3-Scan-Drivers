@@ -65,6 +65,7 @@
                       CONSTANT c_page_latestep, 06         ; Eigene Tastatur 2 Stufen für Tasten 0..60, aus Dynamik errechnet
                       CONSTANT c_page_sostenuto, 07        ; Sostenuto-Flags 0..60
                       CONSTANT c_page_keycontacts, 08      ; vorheriger Tastenzustand 0..60
+                      CONSTANT c_page_xb2data, 09          ; Dynamik-Werte XB2 Upper
                       ;
                       ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
                       ; Portadressen bidirektional
@@ -86,8 +87,16 @@
                       CONSTANT AUXPIO4, 0B                 ; Shift Out Lower SR 4014
                       CONSTANT AUXPIO5, 0C                 ; Shift Out Pedal SR 4014
                       CONSTANT AUXPIO6, 0D                 ; frei für Debug-Zwecke
-                      ;CONSTANT AUXPIO7, 0E                   ; ACHTUNG: Für Rotary-LED-PWM benutzt
+                      ;CONSTANT AUXPIO7, 0E                ; ACHTUNG: Für Rotary-LED-PWM benutzt
                       CONSTANT AUXPIN8, 0F                 ; unbenutzt, nur Eingang!
+                      ;
+                      CONSTANT K_ACK, 00                   ; für XB2, SCANPIO1
+                      CONSTANT K_ENALWR, 01                ; für XB2, SCANPIO2
+                      CONSTANT K_ENAUPR, 02                ; für XB2, SCANPIO3
+                      CONSTANT K_RST, 03                   ; für XB2, SCANPIO4
+                      CONSTANT K_EMPTY, 0E                 ; für XB2, Data Present (D6) AUXPIO7
+                      CONSTANT K_STB, 0F                   ; für XB2, AUXPIN8
+                      CONSTANT K_DATA, 18                  ; für XB2, AUXPORT
                       ;
                       CONSTANT SCANPIN, 10                 ; Fatar Scan Port gesamt READ
                       CONSTANT SCANPORT, 10                ; Fatar Scan Port gesamt WRITE
@@ -100,6 +109,7 @@
                       CONSTANT SWITCHPORT_DDR, 29          ; Switches Port Data Direction
                       ; Output ports
                       CONSTANT c_strobe_mask, 20           ; für indirektes Schreiben
+                      CONSTANT BASE_STROBE, 20            ; Schreibzugriff erzeugt Write für Busbar- und Noise-Enables Upper (1 Byte)
                       CONSTANT UPPER_STROBE, 20            ; Schreibzugriff erzeugt Write für Busbar- und Noise-Enables Upper (1 Byte)
                       CONSTANT LOWER_STROBE, 21            ; Schreibzugriff erzeugt Write für Busbar- und Noise-Enables Lower (1 Byte)
                       CONSTANT PEDAL_STROBE, 22            ; Schreibzugriff erzeugt Write für Pedal-Bits (2 Bits)
@@ -144,6 +154,7 @@
                       CONSTANT FEATURE_SPI_FLAG, 30        ; war "0000000" & spiflag, jetzt "0000001" & spiflag wenn neues FPGA
                       CONSTANT TX_STATUS, 31               ; Bit 0 = TX DIN (1) voll, Bit 1 = TX SAM (2) voll
                       CONSTANT c_read_mask, 34             ; für indirektes Lesen
+                      CONSTANT RD_ALL_BASE, 34             ; für indirektes Lesen
                       CONSTANT RD_UPPER, 34                ; Upper-Byte vom MPX-RAM
                       CONSTANT RD_LOWER, 35                ; Lower-Byte vom MPX-RAM
                       CONSTANT RD_PEDAL, 36                ; Pedal-Bits vom MPX-RAM (1:0)
